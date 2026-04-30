@@ -18,7 +18,27 @@ The `new Function(src)()` form executes the script in the global scope so `windo
 ### Pinning to a version
 
 - `@main` — latest commit on main (auto-updates)
-- `@v7.0.0` — pinned tag (recommended for scheduled production runs)
+- `@v7.1.0` — pinned tag (recommended for scheduled production runs)
+
+### Versions
+
+**v7.1.0** (current)
+- SPY change-percent now sourced from `spyD1.changePct` (was: stale quote endpoint that occasionally returned 0).
+- Counter-trend penalty now fires correctly when SPY moves <0.5% but the individual stock has RS/RW ≥5%.
+- "Just reported" earnings (`daysUntil ∈ [-3, 0]`) now downgrade conviction the same way as "earnings within 7 days" did. Closes the IDCC-class gap where a stock that reported pre-market today still scored HIGH.
+- `maxRecentGap.pct` preserves sign and `direction: 'UP' | 'DOWN'`. The flag now reads "GAP DOWN -14% today" instead of "GAP +6.3% today" when the gap was actually down.
+- New range fields per ticker: `low30d`, `low90d`, `low180d`, `high30d`, `high90d`, `high180d`. Useful when the strict 52-week low/high is too stale to be tradeably relevant.
+- `score.bucket`: one of `CLEAN_SWING` / `CLEAN_DAY` / `EARNINGS_REACTOR` / `COUNTER_TREND` / `WAIT` / `NEUTRAL`. The summary now ranks within buckets — clean swings first, earnings reactors capped at 5, counter-trend section separate.
+- `score.swingCandidate`: boolean, true only when no earnings ±14d AND no recent gap AND R:R ≥2 AND RS sustained.
+- Mag 7 block rendered as a markdown table.
+- aVWAP labels distinguished from price labels: "52w low: $X" (the actual price) is separate from "aVWAP from 52w-LOW date (anchored [date]): $Y" (volume-weighted average since that date).
+
+**v7.0.0**
+- Strict algo lines (≥3 touches, no earnings-gap anchor pairs, hard-exclude projection-only).
+- Horizontal level weighting by touch count (MINOR/MAJOR/KEY).
+- Prior swing highs/lows arrays.
+- Anchored VWAPs from 52w H/L, recent gap, breakout pivot.
+- ATR(20) + breakout-pivot projections (replaces synthetic 1R/2R extensions).
 
 ## Strict v7 algo line method
 

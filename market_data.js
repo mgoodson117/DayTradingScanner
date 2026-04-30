@@ -34,7 +34,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v7.0.0';
+  const VERSION = 'v7.1.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -396,15 +396,41 @@ window.RDT = (function () {
       const overheadSMAs = smaMap.filter(s => s.val && s.val > price).sort((a, b) => a.val - b.val);
       const overnightGapPct = prevDayClose ? parseFloat(((price - prevDayClose) / prevDayClose * 100).toFixed(2)) : 0;
 
-      let maxRecentGap = { pct: 0, daysAgo: null, date: null };
+      // v7.1.0 — preserve sign of overnight gap so direction (UP / DOWN) is available downstream
+      let maxRecentGap = { pct: 0, absPct: 0, daysAgo: null, date: null, direction: null };
       const recentWindow = Math.min(5, candles.length - 1);
       for (let i = candles.length - recentWindow; i < candles.length; i++) {
         if (i < 1) continue;
-        const gap = Math.abs((candles[i].o - candles[i-1].c) / candles[i-1].c * 100);
-        if (gap > maxRecentGap.pct) {
-          maxRecentGap = { pct: parseFloat(gap.toFixed(1)), daysAgo: candles.length - 1 - i, date: fmtDate(candles[i].t) };
+        const signed = (candles[i].o - candles[i-1].c) / candles[i-1].c * 100;
+        const abs = Math.abs(signed);
+        if (abs > maxRecentGap.absPct) {
+          maxRecentGap = {
+            pct: parseFloat(signed.toFixed(1)),
+            absPct: parseFloat(abs.toFixed(1)),
+            daysAgo: candles.length - 1 - i,
+            date: fmtDate(candles[i].t),
+            direction: signed > 0 ? 'UP' : 'DOWN',
+          };
         }
       }
+
+      // v7.1.0 — recent range fields (more useful than 52w for current trade structure)
+      const lowsArr  = candles.map(c => c.l);
+      const highsArr = candles.map(c => c.h);
+      const rangeMin = (arr, days) => {
+        const slice = arr.slice(-days);
+        return slice.length ? parseFloat(Math.min(...slice).toFixed(2)) : null;
+      };
+      const rangeMax = (arr, days) => {
+        const slice = arr.slice(-days);
+        return slice.length ? parseFloat(Math.max(...slice).toFixed(2)) : null;
+      };
+      const low30d   = rangeMin(lowsArr,  30);
+      const low90d   = rangeMin(lowsArr,  90);
+      const low180d  = rangeMin(lowsArr, 180);
+      const high30d  = rangeMax(highsArr, 30);
+      const high90d  = rangeMax(highsArr, 90);
+      const high180d = rangeMax(highsArr, 180);
 
       const algoLines = computeAlgoLinesV7(candles, price);
       const haTrend = getHATrend(candles.slice(-6));
@@ -472,6 +498,7 @@ window.RDT = (function () {
         closes_last5: closes.slice(-5).map(x => parseFloat(x.toFixed(2))),
         fiftyTwoWeekHigh: parseFloat((meta.fiftyTwoWeekHigh || 0).toFixed(2)),
         fiftyTwoWeekLow: parseFloat((meta.fiftyTwoWeekLow || 0).toFixed(2)),
+        low30d, low90d, low180d, high30d, high90d, high180d,
         nearATH: price >= (meta.fiftyTwoWeekHigh || 0) * 0.97,
         nearATL: price <= (meta.fiftyTwoWeekLow || 0) * 1.03,
         maxRecentGap,
@@ -571,22 +598,29 @@ window.RDT = (function () {
   }
 
   function checkEarnings(earningsDate, maxRecentGap) {
-    let futureFlag = '', futureStr = 'Unknown', daysUntil = null, hasUpcoming = false;
+    let futureFlag = '', futureStr = 'Unknown', daysUntil = null;
+    let hasUpcoming = false, justReported = false;
     if (earningsDate) {
       const diffDays = Math.ceil((earningsDate.getTime() - Date.now()) / 86400000);
       daysUntil = diffDays;
       futureStr = earningsDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-      if (diffDays > 0 && diffDays <= 7) { futureFlag = '🚨 EARNINGS WITHIN 7 DAYS'; hasUpcoming = true; }
-      if (diffDays > 7 && diffDays <= 14) futureFlag = '⚠️ Earnings in ~2 weeks';
-      if (diffDays <= 0 && diffDays >= -3) futureFlag = '📊 Just reported';
+      if (diffDays > 0 && diffDays <= 7)  { futureFlag = '🚨 EARNINGS WITHIN 7 DAYS'; hasUpcoming = true; }
+      if (diffDays > 7 && diffDays <= 14)   futureFlag = '⚠️ Earnings in ~2 weeks';
+      if (diffDays <= 0 && diffDays >= -3) { futureFlag = '📊 Just reported'; justReported = true; }
     }
+    // v7.1.0 — signed gap, direction in flag
     let recentGapFlag = '', likelyPostEarnings = false;
-    if (maxRecentGap && maxRecentGap.pct >= 5) {
-      const label = maxRecentGap.daysAgo === 0 ? 'today' : maxRecentGap.daysAgo === 1 ? 'yesterday' : maxRecentGap.daysAgo + ' sessions ago';
-      recentGapFlag = '🔴 GAP ' + (maxRecentGap.pct > 0 ? '+' : '') + maxRecentGap.pct + '% overnight gap ' + label + ' (' + maxRecentGap.date + ') — Step 4D rules apply: half size, day trade only.';
+    if (maxRecentGap && Math.abs(maxRecentGap.pct) >= 5) {
+      const label = maxRecentGap.daysAgo === 0 ? 'today'
+                  : maxRecentGap.daysAgo === 1 ? 'yesterday'
+                  : maxRecentGap.daysAgo + ' sessions ago';
+      const dir  = maxRecentGap.direction || (maxRecentGap.pct > 0 ? 'UP' : 'DOWN');
+      const sign = maxRecentGap.pct > 0 ? '+' : '';
+      recentGapFlag = '🔴 GAP ' + dir + ' ' + sign + maxRecentGap.pct + '% overnight gap ' + label
+                    + ' (' + maxRecentGap.date + ') — Step 4D rules apply: half size, day trade only.';
       likelyPostEarnings = true;
     }
-    return { hasUpcoming, futureStr, daysUntil, futureFlag, recentGapFlag, likelyPostEarnings, displayStr: futureStr, anyFlag: futureFlag || recentGapFlag };
+    return { hasUpcoming, justReported, futureStr, daysUntil, futureFlag, recentGapFlag, likelyPostEarnings, displayStr: futureStr, anyFlag: futureFlag || recentGapFlag };
   }
 
   async function getCrumb() {
@@ -676,18 +710,30 @@ window.RDT = (function () {
 
     const cleanCount = confluences.filter(c => c.includes('✅')).length;
     let conviction = cleanCount >= 5 ? 'HIGH' : cleanCount >= 3 ? 'MEDIUM' : 'LOW';
+    // v7.1.0 — also downgrade for justReported (daysUntil ∈ [-3, 0]).
     if (earningsInfo.hasUpcoming) {
-      if (conviction === 'HIGH') conviction = 'MEDIUM';
+      if (conviction === 'HIGH')   conviction = 'MEDIUM';
       if (conviction === 'MEDIUM') conviction = 'LOW';
       conviction += ' ⚠️ EARNINGS';
+    }
+    if (earningsInfo.justReported) {
+      if (conviction === 'HIGH')   conviction = 'MEDIUM';
+      if (conviction === 'MEDIUM') conviction = 'LOW';
+      conviction += ' 📊 JUST-REPORTED';
     }
     if (earningsInfo.likelyPostEarnings) {
       if (conviction === 'HIGH') conviction = 'MEDIUM';
       conviction += ' 🔴 POST-GAP';
     }
 
+    // v7.1.0 — counter-trend penalty applies even at small SPY moves when individual RS is huge
     const counterTrend = (direction === 'SHORT' && spyChangePct > 0) || (direction === 'LONG' && spyChangePct < 0);
-    const counterTrendStrength = counterTrend ? (Math.abs(spyChangePct) >= 0.5 ? 'STRONG' : 'MILD') : null;
+    const hugeIndividualMove = Math.abs(rsScore) >= 5;
+    const counterTrendStrength = counterTrend
+      ? (Math.abs(spyChangePct) >= 0.5 ? 'STRONG'
+       : hugeIndividualMove ? 'MILD-RS-OVERRIDE'
+       : 'MILD')
+      : null;
 
     const rrEntry = m5?.vwap ? parseFloat(m5.vwap) : d1.price;
     let rrStop, rrT1, rrT2, rrRatio, rrStopNote, rrT1Source;
@@ -743,18 +789,42 @@ window.RDT = (function () {
     let horizWeightBonus = 0;
     brokenAlgoLines.forEach(l => { if (l.style === 'HORIZONTAL') horizWeightBonus += (l.weight || 1) - 1; });
     const rrScoreCap = rrRatio != null ? Math.min(rrRatio, 4) : 1.0;
-    const ctPenalty = counterTrend ? (counterTrendStrength === 'STRONG' ? 0.4 : 0.7) : 1.0;
-    const earningsPen = earningsInfo.hasUpcoming ? 0.1 : earningsInfo.likelyPostEarnings ? 0.75 : 1.0;
+    const ctPenalty = counterTrend
+      ? (counterTrendStrength === 'STRONG'           ? 0.4
+       : counterTrendStrength === 'MILD-RS-OVERRIDE' ? 0.85
+       :                                                0.7)
+      : 1.0;
+    // v7.1.0 — explicit downgrade for justReported (treat like upcoming for scoring purposes)
+    const earningsPen = (earningsInfo.hasUpcoming || earningsInfo.justReported) ? 0.1
+                      : earningsInfo.likelyPostEarnings                          ? 0.75
+                      :                                                            1.0;
     const compositeScore = parseFloat(
       ((cleanCount + horizWeightBonus) * rrScoreCap * haMult * ctPenalty * earningsPen).toFixed(2)
     );
 
-    const swingEligible = !earningsInfo.hasUpcoming && !earningsInfo.likelyPostEarnings && !counterTrend;
+    // v7.1.0 — bucket classification + swing-candidate filter
+    const swingEligible = !earningsInfo.hasUpcoming
+                       && !earningsInfo.justReported
+                       && !earningsInfo.likelyPostEarnings
+                       && !counterTrend;
     const swingNote = !swingEligible
-      ? (earningsInfo.hasUpcoming ? 'No swing — earnings within 7 days'
+      ? (earningsInfo.hasUpcoming      ? 'No swing — earnings within 7 days'
+       : earningsInfo.justReported     ? 'No swing — just reported earnings'
        : earningsInfo.likelyPostEarnings ? 'No swing — post-earnings gap'
        : 'No swing — counter-trend')
       : 'Swing eligible';
+
+    const swingCandidate = swingEligible
+                        && rrRatio != null && rrRatio >= 2
+                        && Math.abs(rsScore) >= 1
+                        && (direction === 'LONG' || direction === 'SHORT');
+
+    let bucket;
+    if (direction === 'NEUTRAL')                                                                       bucket = 'NEUTRAL';
+    else if (counterTrend)                                                                              bucket = 'COUNTER_TREND';
+    else if (earningsInfo.hasUpcoming || earningsInfo.justReported || earningsInfo.likelyPostEarnings) bucket = 'EARNINGS_REACTOR';
+    else if (setupType === 'WAIT_VWAP_RECLAIM')                                                         bucket = 'WAIT';
+    else                                                                                                bucket = swingCandidate ? 'CLEAN_SWING' : 'CLEAN_DAY';
 
     let entryNote = 'No clear setup';
     if (m5 && m5.vwap) {
@@ -778,7 +848,8 @@ window.RDT = (function () {
       direction, setupType, rsScore, hasRS, hasRW,
       confluences, conviction, counterTrend, counterTrendStrength,
       rrEntry, rrStop, rrStopNote, rrT1, rrT1Source, rrT2, rrRatio, poorRR,
-      compositeScore, swingEligible, swingNote, entryNote, stopNote,
+      compositeScore, swingEligible, swingCandidate, swingNote,
+      bucket, entryNote, stopNote,
       brokenAlgoLines,
     };
   }
@@ -812,20 +883,22 @@ window.RDT = (function () {
     return analyze(combined, candidates, spyChangePct);
   }
 
-  async function analyze(tickers, candidates, spyChangePct) {
+  async function analyze(tickers, candidates, spyChangePctIn) {
     const etCtx = getETContext();
-    if (spyChangePct == null) {
-      try {
-        const spyQ = await fetchJSON('https://query1.finance.yahoo.com/v7/finance/quote?symbols=SPY&fields=regularMarketChangePercent');
-        spyChangePct = spyQ?.quoteResponse?.result?.[0]?.regularMarketChangePercent || 0;
-      } catch(e) { spyChangePct = 0; }
-    }
+
+    // v7.1.0 — fetch SPY D1 first to get the canonical change-percent.
+    // The /v7/finance/quote endpoint sometimes returns 0 (caching/timing flakes);
+    // spyD1.changePct is computed from prevDayClose → current price and is always accurate.
+    const [spyD1, spyM5] = await Promise.all([fetchD1('SPY'), fetchM5('SPY')]);
+    const spyChangePct = (spyD1 && !spyD1.error && typeof spyD1.changePct === 'number')
+      ? spyD1.changePct
+      : (spyChangePctIn ?? 0);
+
     const earningsMap = await fetchEarningsDates(tickers);
-    const [sectorBias, vix, spyD1, spyM5, ...tickerData] = await Promise.all([
+
+    const [sectorBias, vix, ...tickerData] = await Promise.all([
       fetchSectorBias(spyChangePct),
       fetchVIX(),
-      fetchD1('SPY'),
-      fetchM5('SPY'),
       ...tickers.map(async t => {
         const [d1, m5] = await Promise.all([fetchD1(t), fetchM5(t)]);
         const cand = (candidates || []).find(c => c.symbol === t);
@@ -835,7 +908,15 @@ window.RDT = (function () {
         return { ticker: t, d1, m5, earningsInfo, score };
       })
     ]);
-    window._scan = { version: VERSION, etCtx, spyChg: spyChangePct, spyD1, spyM5, sectors: sectorBias, vix, tickers: tickerData, candidates: candidates || [] };
+
+    window._scan = {
+      version: VERSION, etCtx,
+      spyChg: spyChangePct,
+      spyD1, spyM5,
+      sectors: sectorBias, vix,
+      tickers: tickerData,
+      candidates: candidates || [],
+    };
     return window._scan;
   }
 
@@ -863,48 +944,121 @@ window.RDT = (function () {
       lines.push('');
       lines.push('▶ ' + s.sectors.huntingGrounds);
     }
-    const m7 = s.tickers.filter(t => MAG7.includes(t.ticker));
+    // v7.1.0 — Mag 7 as a markdown table
+    const m7 = MAG7.map(t => s.tickers.find(x => x.ticker === t)).filter(Boolean);
     const aboveVwap = m7.filter(t => t.m5?.aboveVwap === true).length;
-    const d1Long = m7.filter(t => t.d1?.d1_long_valid).length;
+    const d1Long    = m7.filter(t => t.d1?.d1_long_valid).length;
+    const haBull    = m7.filter(t => t.d1?.haTrend === 'BULLISH').length;
     lines.push('');
-    lines.push('▶ MAG 7: Above VWAP ' + aboveVwap + '/7 | D1 Long ' + d1Long + '/7');
-    const scored = s.tickers.filter(t => t.score && t.score.direction !== 'NEUTRAL').sort((a, b) => b.score.compositeScore - a.score.compositeScore);
+    lines.push('▶ MAG 7 BREADTH: Above VWAP ' + aboveVwap + '/7 | D1 Long ' + d1Long + '/7 | HA Bullish ' + haBull + '/7');
     lines.push('');
-    lines.push('▶ TOP 10 SCORED SETUPS');
-    scored.slice(0, 10).forEach((t, i) => {
+    lines.push('| Ticker | Price | %Chg | RS | D1 Long | VWAP | HA | Earnings | Gap |');
+    lines.push('|--------|-------|------|----|---------|------|----|----------|-----|');
+    m7.forEach(t => {
+      if (!t.d1 || t.d1.error) { lines.push('| ' + t.ticker + ' | (data error) | | | | | | | |'); return; }
+      const ch  = (t.d1.changePct >= 0 ? '+' : '') + t.d1.changePct + '%';
+      const rs  = (t.score?.rsScore != null ? (t.score.rsScore >= 0 ? '+' : '') + t.score.rsScore + '%' : '—');
+      const d1L = t.d1.d1_long_valid ? '✅' : '⛔';
+      const v   = t.m5?.aboveVwap === true ? '✅ ' + (t.m5.vwap || '') : (t.m5?.aboveVwap === false ? '⛔ ' + (t.m5.vwap || '') : '—');
+      const earn = (t.earningsInfo?.displayStr || '—') + (t.earningsInfo?.justReported ? ' 📊' : t.earningsInfo?.hasUpcoming ? ' 🚨' : '');
+      const gapTxt = t.d1.maxRecentGap && Math.abs(t.d1.maxRecentGap.pct) >= 5
+        ? (t.d1.maxRecentGap.direction === 'UP' ? '+' : '') + t.d1.maxRecentGap.pct + '% ' + t.d1.maxRecentGap.date
+        : '—';
+      lines.push('| ' + t.ticker + ' | $' + t.d1.price + ' | ' + ch + ' | ' + rs + ' | ' + d1L + ' | ' + v + ' | ' + t.d1.haTrend + ' | ' + earn + ' | ' + gapTxt + ' |');
+    });
+
+    // v7.1.0 — bucket-aware ranking
+    const scored = s.tickers.filter(t => t.score && t.score.direction !== 'NEUTRAL');
+    const cleanSwings = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const cleanDays   = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const earningsR   = scored.filter(t => t.score.bucket === 'EARNINGS_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const counterT    = scored.filter(t => t.score.bucket === 'COUNTER_TREND').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const waits       = scored.filter(t => t.score.bucket === 'WAIT').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+
+    function renderSetup(t, i) {
       const sc = t.score, d1 = t.d1, m5 = t.m5;
       lines.push('');
-      lines.push('  #' + (i+1) + ' ' + t.ticker + ' — ' + sc.direction + ' | ' + sc.conviction + ' | Score ' + sc.compositeScore);
-      lines.push('     $' + d1.price + ' (' + (d1.changePct >= 0 ? '+' : '') + d1.changePct + '%) RS ' + sc.rsScore + '%');
-      lines.push('     Earnings: ' + t.earningsInfo.displayStr + (t.earningsInfo.anyFlag ? ' ' + t.earningsInfo.anyFlag : ''));
+      lines.push('  #' + (i+1) + ' ' + t.ticker + ' — ' + sc.direction + ' | ' + sc.conviction + ' | Score ' + sc.compositeScore + ' | Bucket ' + sc.bucket);
+      lines.push('     Price $' + d1.price + ' (' + (d1.changePct >= 0 ? '+' : '') + d1.changePct + '%) | RS ' + sc.rsScore + '%');
+      lines.push('     M5 VWAP $' + (m5?.vwap || 'n/a') + ' ' + (m5?.aboveVwap === true ? '✅' : m5?.aboveVwap === false ? '⛔' : ''));
+      lines.push('     HA ' + d1.haTrend + ' | ATR(20) $' + d1.atr20);
+      const earnTxt = t.earningsInfo.displayStr + (t.earningsInfo.anyFlag ? ' — ' + t.earningsInfo.anyFlag : '');
+      lines.push('     Earnings: ' + earnTxt);
+      // v7.1.0 — explicit gap direction
+      if (d1.maxRecentGap && Math.abs(d1.maxRecentGap.pct) >= 5) {
+        lines.push('     Gap ' + d1.maxRecentGap.direction + ' ' + (d1.maxRecentGap.pct > 0 ? '+' : '') + d1.maxRecentGap.pct + '% (' + d1.maxRecentGap.date + ')');
+      }
+      lines.push('     Confluences (' + sc.confluences.length + '):');
       sc.confluences.forEach(c => lines.push('       • ' + c));
+
+      // v7.1.0 — distinct labels for 52w prices vs aVWAPs from those dates
+      lines.push('     Range — 52w: $' + d1.fiftyTwoWeekLow + ' – $' + d1.fiftyTwoWeekHigh
+                + ' | 180d: $' + d1.low180d + ' – $' + d1.high180d
+                + ' | 90d: $' + d1.low90d + ' – $' + d1.high90d
+                + ' | 30d: $' + d1.low30d + ' – $' + d1.high30d);
       if (d1.priorSwingHighs?.length) lines.push('     Prior swing highs: ' + d1.priorSwingHighs.slice(0,3).map(p => '$' + p.price + ' (' + p.daysAgo + 'd)').join(', '));
-      if (d1.priorSwingLows?.length) lines.push('     Prior swing lows:  ' + d1.priorSwingLows.slice(0,3).map(p => '$' + p.price + ' (' + p.daysAgo + 'd)').join(', '));
+      if (d1.priorSwingLows?.length)  lines.push('     Prior swing lows:  ' + d1.priorSwingLows .slice(0,3).map(p => '$' + p.price + ' (' + p.daysAgo + 'd)').join(', '));
+
       if (d1.algoLines?.length) {
         d1.algoLines.slice(0, 4).forEach(l => {
           const tag = l.label && l.label !== 'SLOPED' ? ' [' + l.label + ']' : '';
-          const r2 = l.slopeQuality != null && l.slopeQuality < 1 ? ' R²=' + l.slopeQuality : '';
+          const r2  = l.slopeQuality != null && l.slopeQuality < 1 ? ' R²=' + l.slopeQuality : '';
           const brk = l.recentlyBroken ? ' ← ' + l.breakDirection : '';
           lines.push('     ALGO: ' + l.style + ' ' + l.type + ' $' + l.level + ' (' + l.touches + 't' + r2 + ')' + tag + brk);
         });
       }
       if (d1.anchoredVWAPs) {
         const av = d1.anchoredVWAPs;
-        const parts = [];
-        if (av.from52wHigh) parts.push('52wH→ $' + av.from52wHigh);
-        if (av.from52wLow) parts.push('52wL→ $' + av.from52wLow);
-        if (av.fromRecentGap) parts.push('Gap→ $' + av.fromRecentGap);
-        if (av.fromBreakout) parts.push('Brkout→ $' + av.fromBreakout);
-        if (parts.length) lines.push('     aVWAP: ' + parts.join(' | '));
+        if (av.from52wHigh)   lines.push('     aVWAP from 52w-HIGH date (' + av.anchors['52wHigh']  + '): $' + av.from52wHigh);
+        if (av.from52wLow)    lines.push('     aVWAP from 52w-LOW  date (' + av.anchors['52wLow']   + '): $' + av.from52wLow);
+        if (av.fromRecentGap) lines.push('     aVWAP from RECENT-GAP    (' + av.anchors.recentGap   + '): $' + av.fromRecentGap);
+        if (av.fromBreakout)  lines.push('     aVWAP from BREAKOUT      (' + av.anchors.breakout    + '): $' + av.fromBreakout);
       }
-      if (d1.atr20) lines.push('     ATR(20)=$' + d1.atr20);
       lines.push('     Entry: ' + sc.entryNote);
       lines.push('     Stop:  ' + sc.stopNote);
       if (sc.rrT1) {
-        lines.push('     T1 $' + sc.rrT1 + ' (' + sc.rrT1Source + ')' + (sc.rrT2 ? ' | T2 $' + sc.rrT2 : '') + ' | R:R ' + sc.rrRatio + ':1' + (sc.poorRR ? ' ⚠️' : ''));
+        lines.push('     T1 $' + sc.rrT1 + ' (' + sc.rrT1Source + ')' + (sc.rrT2 ? ' | T2 $' + sc.rrT2 : '') + ' | R:R ' + sc.rrRatio + ':1' + (sc.poorRR ? ' ⚠️ POOR' : ''));
       }
       lines.push('     Swing: ' + sc.swingNote);
-    });
+    }
+
+    // v7.1.0 — clean swings ranked first; earnings reactors capped at 5; rest follow
+    lines.push('');
+    lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    lines.push('▶ CLEAN SWING CANDIDATES (no earnings ±14d, no recent gap, RS sustained, R:R ≥ 2)');
+    lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    if (cleanSwings.length === 0) lines.push('  (none today — earnings week dominates the tape)');
+    else cleanSwings.slice(0, 6).forEach(renderSetup);
+
+    lines.push('');
+    lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    lines.push('▶ CLEAN DAY-TRADE CANDIDATES (no earnings, R:R < 2 or weaker structure)');
+    lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    if (cleanDays.length === 0) lines.push('  (none)');
+    else cleanDays.slice(0, 4).forEach(renderSetup);
+
+    lines.push('');
+    lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    lines.push('▶ EARNINGS REACTORS (post-earnings or just-reported — half size, day trade only)');
+    lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    earningsR.slice(0, 5).forEach(renderSetup);
+
+    if (waits.length > 0) {
+      lines.push('');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      lines.push('▶ WAIT (price below VWAP — conditional on reclaim)');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      waits.slice(0, 3).forEach(renderSetup);
+    }
+
+    if (counterT.length > 0) {
+      lines.push('');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      lines.push('▶ COUNTER-TREND WATCHLIST (only valid IF SPY breaks direction)');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      counterT.slice(0, 5).forEach(renderSetup);
+    }
+
     return lines.join('\n');
   }
 
