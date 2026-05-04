@@ -22,7 +22,7 @@ The `new Function(src)()` form executes the script in the global scope so `windo
 
 ### Versions
 
-**v7.1.0** (current)
+**v7.1.0** (current — tagged 2026-05-04)
 - SPY change-percent now sourced from `spyD1.changePct` (was: stale quote endpoint that occasionally returned 0).
 - Counter-trend penalty now fires correctly when SPY moves <0.5% but the individual stock has RS/RW ≥5%.
 - "Just reported" earnings (`daysUntil ∈ [-3, 0]`) now downgrade conviction the same way as "earnings within 7 days" did. Closes the IDCC-class gap where a stock that reported pre-market today still scored HIGH.
