@@ -9,32 +9,43 @@
  *   window.RDT.analyze([...tickers]) → analyze a specific list
  *   window.RDT.summary()             → formatted output after either call
  *
- * v7 CHANGES vs v6:
+ * v7.2.0 CHANGES vs v7.1.0 — VOLUME AWARENESS:
  *
- *   1. ALGO LINES — strict spec method:
- *      - Lookback 90 daily candles (was 60).
- *      - Sloped lines require ≥3 touches within 0.5% tolerance (was 2).
- *      - Hard reject anchor pairs separated by ≥5% overnight gap.
- *      - Hard exclude projection-only lines (level beyond actual 90-day H/L).
- *      - Each line carries slopeQuality (R² of fit) and recencyScore.
+ *   1. DAILY RVOL — today's volume vs 20-day average daily volume.
+ *      Fields on D1: volume_today, volume_avg20, dailyRVol (e.g. 1.4),
+ *      dailyRVolLabel ('HEAVY' / 'NORMAL' / 'LIGHT' / 'VERY LIGHT').
  *
- *   2. HORIZONTAL LEVEL WEIGHTING:
- *      - 2 touches → MINOR (1.0), 3 touches → MAJOR (1.5), 4+ → KEY (2.0).
+ *   2. PACE RVOL — intraday pace projection. session_volume / (avg_daily ×
+ *      session_elapsed_fraction). Computed in scoreStock so it can use both
+ *      D1 and M5 data plus the ET-context elapsed-time fraction.
+ *      Fields: paceRVol, paceRVolLabel.
  *
- *   3. PRIOR SWING LEVELS: priorSwingHighs/Lows arrays, last 5 each.
+ *   3. BREAKOUT-VOLUME CONFIRMATION — for any algo line with
+ *      recentlyBroken === true, attach breakIdx + breakVolume + breakVolRatio
+ *      (vs avg20). The break confluence is then suffixed with "on N.N×
+ *      volume ✅" when ratio ≥ 1.5, "on N.N× volume ⚠️ suspect" when ratio
+ *      ≤ 0.7, otherwise plain "on N.N× volume".
  *
- *   4. ANCHORED VWAPs: from 52w high, 52w low, recent ≥5% gap, breakout pivot.
+ *   4. PRE-MARKET VOLUME — fetchM5 now uses range=5d & includePrePost=true.
+ *      Today's pre-market candles (4:00–9:30 ET) are summed into
+ *      preMktVolumeToday; the 4 prior days' pre-mkt sums are averaged into
+ *      preMktVolumeAvg4. preMktVolRatio + label flag heavy pre-open interest.
  *
- *   5. ATR + BREAKOUT-PIVOT PROJECTIONS:
- *      - atr20 = 20-day ATR
- *      - For breakout: T1 = pivot + 1×ATR, T2 = pivot + 2×ATR.
- *      - For ATH: T1 = price + 1×ATR, T2 = price + 2×ATR.
- *      - Synthetic 1R/2R extension fallback removed.
+ *   5. VOLUME-AT-PRICE FOR ALGO LINES — horizontal level weighting now
+ *      considers the avg volume on touch days vs the 90-day avg. A level with
+ *      heavy-volume touches (≥1.5×) gets bumped one tier up (MINOR→MAJOR,
+ *      MAJOR→KEY); light-volume (≤0.6×) gets bumped one tier down. Original
+ *      touch count is preserved on the line as `rawTouches`; final weight
+ *      label may differ from raw.
+ *
+ * v7.1.0 (prior):
+ *   - Algo lines strict spec, horizontal weighting, prior swings, anchored
+ *     VWAPs, ATR + breakout-pivot projections, bucket-aware ranking.
  */
 
 window.RDT = (function () {
 
-  const VERSION = 'v7.1.0';
+  const VERSION = 'v7.2.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -49,7 +60,9 @@ window.RDT = (function () {
   const MIN_MKTCAP = 2e9;
   const SCREENER_URL = 'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&count=30&scrIds=';
   const CHART_URL = (t, range) => `https://query1.finance.yahoo.com/v8/finance/chart/${t}?interval=1d&range=${range}`;
-  const M5_URL = (t) => `https://query1.finance.yahoo.com/v8/finance/chart/${t}?interval=5m&range=1d`;
+  // v7.2.0 — range=5d so we can also derive prior-4-days pre-market avg in the same call;
+  // includePrePost=true so today's pre-market candles are available without a 2nd fetch.
+  const M5_URL = (t) => `https://query1.finance.yahoo.com/v8/finance/chart/${t}?interval=5m&range=5d&includePrePost=true`;
 
   const ALGO_LOOKBACK = 90;
   const ALGO_TOUCH_TOL = 0.005;
@@ -103,6 +116,70 @@ window.RDT = (function () {
     }
     const recent = trs.slice(-period);
     return parseFloat((recent.reduce((a, b) => a + b, 0) / period).toFixed(2));
+  }
+
+  // v7.2.0 — average of last `period` candle volumes, excluding today's in-progress candle.
+  function computeAvgVolume(candles, period = 20, excludeToday = true) {
+    const slice = excludeToday && candles.length > period
+      ? candles.slice(-period - 1, -1)
+      : candles.slice(-period);
+    const vols = slice.map(c => c.v).filter(v => v != null && v > 0);
+    if (vols.length === 0) return null;
+    return Math.round(vols.reduce((a, b) => a + b, 0) / vols.length);
+  }
+
+  // v7.2.0 — classify a volume-ratio (today / avg) into a human label.
+  function classifyVolRatio(ratio) {
+    if (ratio == null || !isFinite(ratio)) return 'UNKNOWN';
+    if (ratio >= 2.0) return 'VERY HEAVY';
+    if (ratio >= 1.4) return 'HEAVY';
+    if (ratio >= 0.85) return 'NORMAL';
+    if (ratio >= 0.6) return 'LIGHT';
+    return 'VERY LIGHT';
+  }
+
+  // v7.2.0 — emoji decoration for inline volume render.
+  function volEmoji(ratio) {
+    if (ratio == null || !isFinite(ratio)) return '';
+    if (ratio >= 2.0) return '🔥';
+    if (ratio >= 1.4) return '✅';
+    if (ratio >= 0.85) return '';
+    if (ratio >= 0.6) return '⚠️';
+    return '⚠️⚠️';
+  }
+
+  // v7.2.0 — what fraction of the regular session has elapsed?
+  // Returns 0.0 before 9:30 ET, 1.0 after 16:00 ET, fractional in between.
+  function sessionElapsedFraction(etCtx) {
+    if (!etCtx) return null;
+    const open = 9 * 60 + 30;   // 570
+    const close = 16 * 60;      // 960
+    const sessionMin = close - open; // 390
+    if (etCtx.totalMin <= open) return 0;
+    if (etCtx.totalMin >= close) return 1;
+    return (etCtx.totalMin - open) / sessionMin;
+  }
+
+  // v7.2.0 — promote/demote a horizontal level label by one tier based on
+  // touch-volume ratio. Keeps weight in lockstep with the displayed label
+  // so downstream confluence-bonus math stays consistent.
+  function adjustLabelByVolume(rawLabel, rawWeight, volRatio) {
+    if (volRatio == null || !isFinite(volRatio)) {
+      return { label: rawLabel, weight: rawWeight, volAdjusted: false };
+    }
+    const tiers = ['MINOR', 'MAJOR', 'KEY'];
+    const weights = { MINOR: 1.0, MAJOR: 1.5, KEY: 2.0 };
+    const idx = tiers.indexOf(rawLabel);
+    if (idx < 0) return { label: rawLabel, weight: rawWeight, volAdjusted: false };
+    let newIdx = idx;
+    if (volRatio >= 1.5) newIdx = Math.min(2, idx + 1);
+    else if (volRatio <= 0.6) newIdx = Math.max(0, idx - 1);
+    const newLabel = tiers[newIdx];
+    return {
+      label: newLabel,
+      weight: weights[newLabel],
+      volAdjusted: newIdx !== idx,
+    };
   }
 
   function findPriorSwingLevels(candles, count = 5) {
@@ -167,6 +244,14 @@ window.RDT = (function () {
     const n = recent.length;
     if (n < 10) return [];
 
+    // v7.2.0 — average volume across the 90-day window (excluding today's
+    // in-progress candle). Used for breakout-volume confirmation and for
+    // weighting horizontal-level touches by the volume on touch days.
+    const volPool = recent.slice(0, -1).map(c => c.v).filter(v => v != null && v > 0);
+    const avgVolWindow = volPool.length
+      ? volPool.reduce((a, b) => a + b, 0) / volPool.length
+      : null;
+
     const swingHighs = [], swingLows = [];
     for (let i = 2; i < n - 2; i++) {
       if (recent[i].h > recent[i-1].h && recent[i].h > recent[i-2].h &&
@@ -226,12 +311,24 @@ window.RDT = (function () {
           const meanIdx = touchPivots.reduce((s, p) => s + p.idx, 0) / touchPivots.length;
           const recencyScore = parseFloat((meanIdx / (n - 1)).toFixed(2));
 
-          let recentlyBroken = false, breakDirection = null;
+          let recentlyBroken = false, breakDirection = null, breakIdx = null;
           for (let k = Math.max(0, n - 6); k < n - 1; k++) {
             const lineAt = p1.price + slope * (k - p1.idx);
             const lineNext = p1.price + slope * (k + 1 - p1.idx);
-            if (recent[k].c < lineAt && recent[k+1].c > lineNext) { recentlyBroken = true; breakDirection = 'BROKE_ABOVE'; }
-            if (recent[k].c > lineAt && recent[k+1].c < lineNext) { recentlyBroken = true; breakDirection = 'BROKE_BELOW'; }
+            if (recent[k].c < lineAt && recent[k+1].c > lineNext) {
+              recentlyBroken = true; breakDirection = 'BROKE_ABOVE'; breakIdx = k + 1;
+            }
+            if (recent[k].c > lineAt && recent[k+1].c < lineNext) {
+              recentlyBroken = true; breakDirection = 'BROKE_BELOW'; breakIdx = k + 1;
+            }
+          }
+
+          // v7.2.0 — breakout-volume confirmation
+          let breakVolume = null, breakVolRatio = null, breakVolLabel = null;
+          if (recentlyBroken && breakIdx != null && recent[breakIdx]?.v && avgVolWindow) {
+            breakVolume = recent[breakIdx].v;
+            breakVolRatio = parseFloat((breakVolume / avgVolWindow).toFixed(2));
+            breakVolLabel = classifyVolRatio(breakVolRatio);
           }
 
           candidates.push({
@@ -243,7 +340,9 @@ window.RDT = (function () {
             recencyScore,
             nearCurrent: Math.abs(projected - currentPrice) / currentPrice < 0.03,
             above: projected > currentPrice,
-            recentlyBroken, breakDirection, weight: 1.0, label: 'SLOPED',
+            recentlyBroken, breakDirection, breakIdx,
+            breakVolume, breakVolRatio, breakVolLabel,
+            weight: 1.0, label: 'SLOPED',
           });
         }
       }
@@ -271,19 +370,50 @@ window.RDT = (function () {
       used.add(i);
       if (cluster.length >= 2) {
         const avg = parseFloat((cluster.reduce((s, p) => s + p.price, 0) / cluster.length).toFixed(2));
-        let recentlyBroken = false, breakDirection = null;
+        let recentlyBroken = false, breakDirection = null, breakIdx = null;
         for (let k = Math.max(0, n - 6); k < n - 1; k++) {
-          if (recent[k].c < avg && recent[k+1].c > avg) { recentlyBroken = true; breakDirection = 'BROKE_ABOVE'; break; }
-          if (recent[k].c > avg && recent[k+1].c < avg) { recentlyBroken = true; breakDirection = 'BROKE_BELOW'; break; }
+          if (recent[k].c < avg && recent[k+1].c > avg) { recentlyBroken = true; breakDirection = 'BROKE_ABOVE'; breakIdx = k + 1; break; }
+          if (recent[k].c > avg && recent[k+1].c < avg) { recentlyBroken = true; breakDirection = 'BROKE_BELOW'; breakIdx = k + 1; break; }
         }
-        let weight, label;
-        if (cluster.length >= 4)       { weight = 2.0; label = 'KEY'; }
-        else if (cluster.length === 3) { weight = 1.5; label = 'MAJOR'; }
-        else                            { weight = 1.0; label = 'MINOR'; }
+
+        // v7.2.0 — raw weights from touch count
+        let rawWeight, rawLabel;
+        if (cluster.length >= 4)       { rawWeight = 2.0; rawLabel = 'KEY'; }
+        else if (cluster.length === 3) { rawWeight = 1.5; rawLabel = 'MAJOR'; }
+        else                            { rawWeight = 1.0; rawLabel = 'MINOR'; }
+
+        // v7.2.0 — average volume on touch days, ratio vs window avg
+        const touchVols = cluster.map(p => recent[p.idx]?.v).filter(v => v != null && v > 0);
+        const avgTouchVol = touchVols.length
+          ? touchVols.reduce((a, b) => a + b, 0) / touchVols.length
+          : null;
+        const touchVolRatio = (avgTouchVol && avgVolWindow)
+          ? parseFloat((avgTouchVol / avgVolWindow).toFixed(2))
+          : null;
+        const touchVolLabel = classifyVolRatio(touchVolRatio);
+        const adjusted = adjustLabelByVolume(rawLabel, rawWeight, touchVolRatio);
+
+        // v7.2.0 — breakout-candle volume on horizontal break
+        let breakVolume = null, breakVolRatio = null, breakVolLabel = null;
+        if (recentlyBroken && breakIdx != null && recent[breakIdx]?.v && avgVolWindow) {
+          breakVolume = recent[breakIdx].v;
+          breakVolRatio = parseFloat((breakVolume / avgVolWindow).toFixed(2));
+          breakVolLabel = classifyVolRatio(breakVolRatio);
+        }
+
         lines.push({
           type: avg > currentPrice ? 'RESISTANCE' : 'SUPPORT',
-          style: 'HORIZONTAL', level: avg, touches: cluster.length, weight, label,
-          slopeQuality: 1.0, nearCurrent: Math.abs(avg - currentPrice) / currentPrice < 0.03,
+          style: 'HORIZONTAL', level: avg,
+          touches: cluster.length,
+          rawTouches: cluster.length,           // v7.2.0 — preserved
+          weight: adjusted.weight,
+          label: adjusted.label,
+          rawLabel,                             // v7.2.0 — pre-vol-adjustment
+          volAdjusted: adjusted.volAdjusted,    // v7.2.0 — true if label moved up/down a tier
+          touchVolRatio, touchVolLabel,         // v7.2.0
+          breakIdx, breakVolume, breakVolRatio, breakVolLabel,  // v7.2.0
+          slopeQuality: 1.0,
+          nearCurrent: Math.abs(avg - currentPrice) / currentPrice < 0.03,
           above: avg > currentPrice, recentlyBroken, breakDirection,
           anchor1: { price: avg.toFixed(2), date: fmtDate(cluster[0].t) },
           anchor2: { price: avg.toFixed(2), date: fmtDate(cluster[cluster.length - 1].t) },
@@ -437,6 +567,16 @@ window.RDT = (function () {
       const swingLevels = findPriorSwingLevels(candles, 5);
       const atr20 = computeATR(candles, 20);
 
+      // v7.2.0 — daily RVOL (today's full-day volume vs 20-day average,
+      // excluding today). For mid-session this is "today so far", which
+      // the scoreStock pace-RVol calc adjusts for elapsed-fraction.
+      const volume_today = candles.length > 0 ? (candles[candles.length - 1].v || 0) : 0;
+      const volume_avg20 = computeAvgVolume(candles, 20, true);
+      const dailyRVol = (volume_today && volume_avg20)
+        ? parseFloat((volume_today / volume_avg20).toFixed(2))
+        : null;
+      const dailyRVolLabel = classifyVolRatio(dailyRVol);
+
       const high52Idx = findHighIdx(candles, meta.fiftyTwoWeekHigh);
       const low52Idx = findLowIdx(candles, meta.fiftyTwoWeekLow);
       const recentGapIdx = findRecentGapIdx(candles, 5);
@@ -502,6 +642,8 @@ window.RDT = (function () {
         nearATH: price >= (meta.fiftyTwoWeekHigh || 0) * 0.97,
         nearATL: price <= (meta.fiftyTwoWeekLow || 0) * 1.03,
         maxRecentGap,
+        // v7.2.0 — volume awareness
+        volume_today, volume_avg20, dailyRVol, dailyRVolLabel,
       };
     } catch(e) { return { ticker, error: e.message || 'fetch failed' }; }
   }
@@ -530,13 +672,47 @@ window.RDT = (function () {
 
       const sessionCloses = [], sessionVolumes = [], sessionOpens = [];
       let cumTPV = 0, cumVol = 0;
+      // v7.2.0 — pre-market volume (today + prior days for averaging)
+      let preMktVolumeToday = 0;
+      const preMktDailyVolumes = {}; // dateKey → cumulative pre-mkt volume
+
+      // Build a map of regular-session windows per day in the 5d range (one per
+      // unique YYYY-MM-DD in ET). Yahoo's currentTradingPeriod only describes
+      // the current/next session; for prior days, we approximate via 4:00 ET
+      // start and 9:30 ET end as the pre-market window.
+      function dateKey(ts) {
+        return new Date(ts * 1000).toLocaleDateString('en-US', {
+          timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+        });
+      }
+      function isPreMktTs(ts) {
+        const et = new Date(new Date(ts * 1000).toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        const min = et.getHours() * 60 + et.getMinutes();
+        // Pre-market: 4:00 ET (240) → 9:30 ET (570).
+        return min >= 240 && min < 570;
+      }
+
+      const todayKey = dateKey(nowTs);
+
       ts.forEach((t, i) => {
-        if (t < regularStart) return;
         const h = q.high[i], l = q.low[i], c = q.close[i], v = q.volume[i], o = q.open?.[i];
-        if (c != null) sessionCloses.push(c);
-        if (v != null) sessionVolumes.push(v);
-        if (o != null) sessionOpens.push(o);
-        if (h && l && c && v) { cumTPV += ((h + l + c) / 3) * v; cumVol += v; }
+        const k = dateKey(t);
+        const inRegular = t >= regularStart && t < regularEnd;
+        const inPreMkt = isPreMktTs(t);
+
+        // Today's regular-session aggregation (existing logic)
+        if (inRegular && k === todayKey) {
+          if (c != null) sessionCloses.push(c);
+          if (v != null) sessionVolumes.push(v);
+          if (o != null) sessionOpens.push(o);
+          if (h && l && c && v) { cumTPV += ((h + l + c) / 3) * v; cumVol += v; }
+        }
+
+        // Pre-market volume bucketing — today and prior days
+        if (inPreMkt && v != null) {
+          if (k === todayKey) preMktVolumeToday += v;
+          else preMktDailyVolumes[k] = (preMktDailyVolumes[k] || 0) + v;
+        }
       });
 
       const vwap = cumVol > 0 ? parseFloat((cumTPV / cumVol).toFixed(2)) : null;
@@ -557,6 +733,19 @@ window.RDT = (function () {
       const aboveVwap = vwap != null ? price > vwap : null;
       const aboveSma20 = sma20 != null ? price > sma20 : null;
 
+      // v7.2.0 — pre-market volume averaging (last 4 prior days)
+      const priorDayVols = Object.values(preMktDailyVolumes).filter(v => v > 0);
+      const preMktVolumeAvg4 = priorDayVols.length
+        ? Math.round(priorDayVols.reduce((a, b) => a + b, 0) / priorDayVols.length)
+        : null;
+      const preMktVolRatio = (preMktVolumeToday && preMktVolumeAvg4)
+        ? parseFloat((preMktVolumeToday / preMktVolumeAvg4).toFixed(2))
+        : null;
+      const preMktVolLabel = classifyVolRatio(preMktVolRatio);
+
+      // v7.2.0 — sessionVolume = sum of today's regular-session candle volumes
+      const sessionVolume = sessionVolumes.reduce((a, b) => a + b, 0);
+
       return {
         ticker, price: price?.toFixed(2),
         vwap: vwap?.toFixed(2) ?? null, aboveVwap,
@@ -569,6 +758,13 @@ window.RDT = (function () {
         volTrend, greenStreak,
         candleCount: sessionCloses.length,
         marketState, isRegularSession,
+        // v7.2.0 — volume fields
+        sessionVolume,
+        preMktVolumeToday,
+        preMktVolumeAvg4,
+        preMktVolRatio,
+        preMktVolLabel,
+        preMktDayCount: priorDayVols.length,
       };
     } catch(e) { return { ticker, error: e.message || 'fetch failed' }; }
   }
@@ -662,11 +858,37 @@ window.RDT = (function () {
     return map;
   }
 
-  function scoreStock(d1, m5, spyChangePct, earningsInfo) {
+  function scoreStock(d1, m5, spyChangePct, earningsInfo, etCtx) {
     const rsScore = parseFloat((d1.changePct - spyChangePct).toFixed(2));
     const hasRS = rsScore > 0.5, hasRW = rsScore < -0.5;
     const nearAlgoLines = (d1.algoLines || []).filter(l => l.nearCurrent);
     const brokenAlgoLines = (d1.algoLines || []).filter(l => l.recentlyBroken);
+
+    // v7.2.0 — pace RVol: today's session-volume-so-far vs (avg-daily × elapsed-fraction)
+    let paceRVol = null, paceRVolLabel = null;
+    const elapsed = sessionElapsedFraction(etCtx);
+    if (m5?.sessionVolume && d1.volume_avg20 && elapsed && elapsed > 0.05) {
+      const expected = d1.volume_avg20 * elapsed;
+      paceRVol = parseFloat((m5.sessionVolume / expected).toFixed(2));
+      paceRVolLabel = classifyVolRatio(paceRVol);
+    }
+
+    // v7.2.0 — helper to suffix a break confluence with breakout-volume info
+    function breakVolSuffix(line) {
+      const r = line.breakVolRatio;
+      if (r == null) return '';
+      if (r >= 1.5) return ` on ${r}× volume ✅`;
+      if (r <= 0.7) return ` on ${r}× volume ⚠️ suspect`;
+      return ` on ${r}× volume`;
+    }
+    // v7.2.0 — touch-volume hint for horizontal lines (in addition to label)
+    function touchVolSuffix(line) {
+      const r = line.touchVolRatio;
+      if (r == null) return '';
+      if (r >= 1.5) return ` [touches at ${r}× vol — institutional memory]`;
+      if (r <= 0.6) return ` [touches at ${r}× vol — light, downgrade]`;
+      return '';
+    }
 
     let direction = 'NEUTRAL', setupType = 'NONE', confluences = [];
 
@@ -679,12 +901,20 @@ window.RDT = (function () {
       if (m5?.volTrend === 'RISING') confluences.push('M5 volume rising ✅');
       if (m5?.greenStreak >= 3) confluences.push(m5.greenStreak + ' consecutive green M5 candles ✅');
       if (d1.haTrend === 'BULLISH') confluences.push('D1 HA bullish continuation ✅');
+      // v7.2.0 — pace-RVol confluence when heavy
+      if (paceRVol != null && paceRVol >= 1.4) confluences.push(`📊 Pace RVol ${paceRVol}× (${paceRVolLabel}) — institutional flow ✅`);
+      else if (paceRVol != null && paceRVol <= 0.7) confluences.push(`⚠️ Pace RVol ${paceRVol}× (${paceRVolLabel}) — light volume`);
+      // v7.2.0 — pre-market volume confluence for gap names
+      if (m5?.preMktVolRatio != null && m5.preMktVolRatio >= 2 && m5.preMktDayCount >= 2) {
+        confluences.push(`🚀 Pre-mkt volume ${m5.preMktVolRatio}× avg (${m5.preMktVolLabel}) — institutional pre-open interest ✅`);
+      }
       brokenAlgoLines.forEach(l => {
         if (l.style === 'DESCENDING' && l.breakDirection === 'BROKE_ABOVE')
-          confluences.push('🔥 BROKE ABOVE descending resistance $' + l.level + ' (' + l.touches + ' touches) ✅');
+          confluences.push('🔥 BROKE ABOVE descending resistance $' + l.level + ' (' + l.touches + ' touches)' + breakVolSuffix(l) + ' ✅');
         if (l.style === 'HORIZONTAL' && l.breakDirection === 'BROKE_ABOVE') {
           const tag = l.label === 'KEY' ? '🔥🔥 KEY ' : l.label === 'MAJOR' ? '🔥 MAJOR ' : '';
-          confluences.push(tag + 'BROKE ABOVE horizontal resistance $' + l.level + ' (' + l.touches + ' touches) ✅');
+          const adj = l.volAdjusted ? ` (vol-adj from ${l.rawLabel})` : '';
+          confluences.push(tag + 'BROKE ABOVE horizontal resistance $' + l.level + ' (' + l.touches + ' touches)' + adj + breakVolSuffix(l) + touchVolSuffix(l) + ' ✅');
         }
       });
     } else if (d1.d1_short_valid && hasRW) {
@@ -693,12 +923,15 @@ window.RDT = (function () {
       confluences.push('RW ' + rsScore + '% vs SPY ✅');
       if (m5?.m5_short_valid) confluences.push('M5 below VWAP + SMA20 ✅');
       if (d1.haTrend === 'BEARISH') confluences.push('D1 HA bearish continuation ✅');
+      // v7.2.0 — heavy volume on a down day = real distribution
+      if (paceRVol != null && paceRVol >= 1.4) confluences.push(`📊 Pace RVol ${paceRVol}× (${paceRVolLabel}) — institutional distribution ✅`);
       brokenAlgoLines.forEach(l => {
         if (l.style === 'ASCENDING' && l.breakDirection === 'BROKE_BELOW')
-          confluences.push('🔥 BROKE BELOW ascending support $' + l.level + ' (' + l.touches + ' touches) ✅');
+          confluences.push('🔥 BROKE BELOW ascending support $' + l.level + ' (' + l.touches + ' touches)' + breakVolSuffix(l) + ' ✅');
         if (l.style === 'HORIZONTAL' && l.breakDirection === 'BROKE_BELOW') {
           const tag = l.label === 'KEY' ? '🔥🔥 KEY ' : l.label === 'MAJOR' ? '🔥 MAJOR ' : '';
-          confluences.push(tag + 'BROKE BELOW horizontal support $' + l.level + ' (' + l.touches + ' touches) ✅');
+          const adj = l.volAdjusted ? ` (vol-adj from ${l.rawLabel})` : '';
+          confluences.push(tag + 'BROKE BELOW horizontal support $' + l.level + ' (' + l.touches + ' touches)' + adj + breakVolSuffix(l) + touchVolSuffix(l) + ' ✅');
         }
       });
     } else if (d1.d1_long_valid && hasRS && m5 && !m5.m5_long_valid) {
@@ -706,6 +939,7 @@ window.RDT = (function () {
       confluences.push('D1 above all SMAs ✅');
       confluences.push('RS +' + rsScore + '% vs SPY ✅');
       confluences.push('⏳ M5 below VWAP $' + m5.vwap + ' — waiting for reclaim');
+      if (paceRVol != null && paceRVol >= 1.4) confluences.push(`📊 Pace RVol ${paceRVol}× (${paceRVolLabel}) — building volume on the wait ✅`);
     }
 
     const cleanCount = confluences.filter(c => c.includes('✅')).length;
@@ -851,6 +1085,8 @@ window.RDT = (function () {
       compositeScore, swingEligible, swingCandidate, swingNote,
       bucket, entryNote, stopNote,
       brokenAlgoLines,
+      // v7.2.0 — volume metrics surfaced for rendering
+      paceRVol, paceRVolLabel,
     };
   }
 
@@ -904,7 +1140,7 @@ window.RDT = (function () {
         const cand = (candidates || []).find(c => c.symbol === t);
         const earningsDate = earningsMap[t] || cand?.earningsDate || null;
         const earningsInfo = checkEarnings(earningsDate, d1.maxRecentGap);
-        const score = (d1.error || m5.error) ? null : scoreStock(d1, m5, spyChangePct, earningsInfo);
+        const score = (d1.error || m5.error) ? null : scoreStock(d1, m5, spyChangePct, earningsInfo, etCtx);
         return { ticker: t, d1, m5, earningsInfo, score };
       })
     ]);
@@ -935,6 +1171,10 @@ window.RDT = (function () {
       lines.push('  SMA20=$' + sd1.sma20 + ' | SMA50=$' + sd1.sma50 + ' | SMA100=$' + sd1.sma100 + ' | SMA200=$' + sd1.sma200);
       lines.push('  D1 Long: ' + (sd1.d1_long_valid ? '✅' : '⛔') + ' | HA: ' + sd1.haTrend + ' | ATR(20): $' + sd1.atr20);
       if (sm5 && !sm5.error) lines.push('  M5: VWAP $' + sm5.vwap + ' | ' + getM5TrendState(sm5));
+      // v7.2.0 — SPY-level volume read for the daily-bias block
+      if (sd1.dailyRVol != null) {
+        lines.push('  📊 SPY Volume — Daily RVol ' + sd1.dailyRVol + '× (' + sd1.dailyRVolLabel + ') ' + volEmoji(sd1.dailyRVol));
+      }
     }
     if (s.vix && !s.vix.error) {
       lines.push('');
@@ -982,6 +1222,14 @@ window.RDT = (function () {
       lines.push('     Price $' + d1.price + ' (' + (d1.changePct >= 0 ? '+' : '') + d1.changePct + '%) | RS ' + sc.rsScore + '%');
       lines.push('     M5 VWAP $' + (m5?.vwap || 'n/a') + ' ' + (m5?.aboveVwap === true ? '✅' : m5?.aboveVwap === false ? '⛔' : ''));
       lines.push('     HA ' + d1.haTrend + ' | ATR(20) $' + d1.atr20);
+      // v7.2.0 — inline volume block
+      const volBits = [];
+      if (sc.paceRVol != null) volBits.push(`Pace RVol ${sc.paceRVol}× (${sc.paceRVolLabel}) ${volEmoji(sc.paceRVol)}`);
+      if (d1.dailyRVol != null) volBits.push(`Daily RVol ${d1.dailyRVol}× (${d1.dailyRVolLabel})`);
+      if (m5?.preMktVolRatio != null && m5.preMktDayCount >= 2) {
+        volBits.push(`Pre-mkt ${m5.preMktVolRatio}× (${m5.preMktVolLabel}) ${volEmoji(m5.preMktVolRatio)}`);
+      }
+      if (volBits.length) lines.push('     📊 Volume — ' + volBits.join(' | '));
       const earnTxt = t.earningsInfo.displayStr + (t.earningsInfo.anyFlag ? ' — ' + t.earningsInfo.anyFlag : '');
       lines.push('     Earnings: ' + earnTxt);
       // v7.1.0 — explicit gap direction
@@ -1002,9 +1250,13 @@ window.RDT = (function () {
       if (d1.algoLines?.length) {
         d1.algoLines.slice(0, 4).forEach(l => {
           const tag = l.label && l.label !== 'SLOPED' ? ' [' + l.label + ']' : '';
+          const adj = l.volAdjusted ? ` (vol→${l.label})` : '';
           const r2  = l.slopeQuality != null && l.slopeQuality < 1 ? ' R²=' + l.slopeQuality : '';
           const brk = l.recentlyBroken ? ' ← ' + l.breakDirection : '';
-          lines.push('     ALGO: ' + l.style + ' ' + l.type + ' $' + l.level + ' (' + l.touches + 't' + r2 + ')' + tag + brk);
+          // v7.2.0 — inline volume info
+          const tv = l.touchVolRatio != null ? ` touchVol=${l.touchVolRatio}×` : '';
+          const bv = l.recentlyBroken && l.breakVolRatio != null ? ` brkVol=${l.breakVolRatio}×` : '';
+          lines.push('     ALGO: ' + l.style + ' ' + l.type + ' $' + l.level + ' (' + l.touches + 't' + r2 + ')' + tag + adj + brk + tv + bv);
         });
       }
       if (d1.anchoredVWAPs) {
@@ -1067,6 +1319,8 @@ window.RDT = (function () {
     fetchD1, fetchM5, fetchVIX, fetchSectorBias,
     computeAlgoLinesV7, findPriorSwingLevels, computeATR, computeAnchoredVWAP,
     getETContext, getHODProximity, getM5TrendState,
+    // v7.2.0 — exposed volume helpers
+    computeAvgVolume, classifyVolRatio, sessionElapsedFraction,
   };
 })();
 
