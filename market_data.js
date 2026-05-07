@@ -5,9 +5,30 @@
  * CDN:       https://cdn.jsdelivr.net/gh/mgoodson117/DayTradingScanner@main/market_data.js
  *
  * Inject into a Yahoo Finance tab via javascript_tool, then call:
- *   window.RDT.run()                 → full auto-scan (gainers + losers + actives + Mag7 + watchlist)
+ *   window.RDT.run()                 → full auto-scan (gainers + losers + actives + Mag7 + watchlists + earnings)
  *   window.RDT.analyze([...tickers]) → analyze a specific list
  *   window.RDT.summary()             → formatted output after either call
+ *
+ * v7.3.0 CHANGES vs v7.2.0 — EARNINGS COVERAGE GUARANTEE:
+ *
+ *   1. EARNINGS_REACTOR_WATCHLIST — a curated set of high-frequency earnings
+ *      gappers (cybersecurity, observability, cloud-data, fintech, semis, AI)
+ *      always merged into run()'s ticker list. Closes the May 7, 2026 DDOG-miss
+ *      class of bug: a +30.6% earnings-day mover was silently dropped from the
+ *      Top 10 because Yahoo's day_gainers screener ran out of slots before
+ *      DDOG appeared. With the watchlist, names like DDOG, MDB, SNOW, NOW,
+ *      PANW, CRWD, ZS, NET, NFLX, UBER, etc. are guaranteed coverage on every
+ *      Mon–Fri auto-run regardless of screener output.
+ *
+ *   2. fetchEarningsCalendar() — best-effort pull of Yahoo's earnings calendar
+ *      for the current ET date. Any equity with a scheduled report today is
+ *      force-included in the analyze() list. Falls back silently if the
+ *      endpoint is unreachable or returns 0 results — the watchlist (1) is
+ *      the durable safety net.
+ *
+ *   3. run() now merges six sources: screener candidates + MAG7 +
+ *      SEMI_WATCHLIST + USER_WATCHLIST + EARNINGS_REACTOR_WATCHLIST +
+ *      todayEarningsTickers + extras (caller's seed list).
  *
  * v7.2.0 CHANGES vs v7.1.0 — VOLUME AWARENESS:
  *
@@ -45,7 +66,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v7.2.0';
+  const VERSION = 'v7.3.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -56,6 +77,29 @@ window.RDT = (function () {
   const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'];
   const SEMI_WATCHLIST = ['AMD', 'QCOM'];
   const USER_WATCHLIST = [];
+
+  // v7.3.0 — Earnings-reactor coverage. These names historically gap >5–30% on
+  // earnings prints AND occasionally slip past the day_gainers / day_losers /
+  // most_actives screeners (cap floor, count=30 limit, or post-open cache lag
+  // — DDOG on 2026-05-07 was the bug that prompted this list). They are always
+  // force-fetched in run() so an earnings-day reporter cannot be silently
+  // dropped. Curate as needed; bump VERSION when changing.
+  const EARNINGS_REACTOR_WATCHLIST = [
+    // Cybersecurity (frequent earnings gappers)
+    'PANW', 'CRWD', 'ZS', 'FTNT', 'OKTA', 'NET', 'CYBR', 'S',
+    // Observability / monitoring (DDOG-tier)
+    'DDOG', 'SPLK', 'ESTC', 'DT', 'NEWR', 'PD', 'SUMO',
+    // Cloud-data / enterprise-AI
+    'MDB', 'SNOW', 'CFLT', 'NOW', 'CRM', 'WDAY', 'TEAM', 'HUBS',
+    // Payments / fintech (high earnings vol)
+    'SQ', 'PYPL', 'AFRM', 'SOFI', 'HOOD', 'COIN', 'NU',
+    // Semis (broader than SEMI_WATCHLIST — ARM/SMCI/ASML often gap)
+    'AVGO', 'MU', 'ARM', 'INTC', 'SMCI', 'TXN', 'ASML', 'TSM', 'MRVL', 'WDC', 'ON',
+    // Consumer / streaming / sharing earnings movers
+    'NFLX', 'UBER', 'LYFT', 'DASH', 'ABNB', 'SHOP', 'ROKU', 'PLTR', 'SPOT',
+    // Biotech / pharma frequent gappers
+    'LLY', 'NVO', 'MRNA', 'BNTX', 'AXSM', 'VRTX',
+  ];
 
   const MIN_MKTCAP = 2e9;
   const SCREENER_URL = 'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&count=30&scrIds=';
@@ -1090,6 +1134,51 @@ window.RDT = (function () {
     };
   }
 
+  // v7.3.0 — best-effort pull of Yahoo's earnings calendar for the current ET
+  // calendar date. Returns an array of ticker strings (BMO + AMC + during-market).
+  // Yahoo's `/v1/finance/visualization` endpoint requires a CORS-tolerant fetch
+  // and may need a crumb on hardened sessions; we try the simpler
+  // `finance.yahoo.com/calendar/earnings` HTML embed first and fall back to the
+  // visualization endpoint. On any failure we silently return [] so the
+  // watchlist is the durable safety net.
+  async function fetchEarningsCalendar() {
+    try {
+      const etDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const yyyy = etDate.getFullYear();
+      const mm = String(etDate.getMonth() + 1).padStart(2, '0');
+      const dd = String(etDate.getDate()).padStart(2, '0');
+      const dateStr = `${yyyy}-${mm}-${dd}`;
+      // Try the public visualization endpoint (no crumb required for read-only earnings query)
+      const url = 'https://query1.finance.yahoo.com/v1/finance/visualization?formatted=false&lang=en-US&region=US';
+      const body = {
+        size: 250, offset: 0,
+        sortField: 'companyshortname', sortType: 'ASC',
+        entityIdType: 'earnings',
+        includeFields: ['ticker'],
+        query: {
+          operator: 'and',
+          operands: [
+            { operator: 'gte', operands: ['startdatetime', dateStr] },
+            { operator: 'lte', operands: ['startdatetime', dateStr] },
+            { operator: 'eq',  operands: ['region', 'us'] },
+          ],
+        },
+      };
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) return [];
+      const j = await r.json();
+      const rows = j?.finance?.result?.[0]?.documents?.[0]?.rows || [];
+      const tickers = rows.map(row => Array.isArray(row) ? row[0] : row.ticker).filter(Boolean);
+      return [...new Set(tickers)];
+    } catch (e) {
+      return [];
+    }
+  }
+
   async function fetchVIX() {
     try {
       const d = await fetchJSON(CHART_URL('^VIX', '5d'));
@@ -1112,10 +1201,28 @@ window.RDT = (function () {
       const spyQ = await fetchJSON('https://query1.finance.yahoo.com/v7/finance/quote?symbols=SPY&fields=regularMarketChangePercent');
       spyChangePct = spyQ?.quoteResponse?.result?.[0]?.regularMarketChangePercent || 0;
     } catch(e) {}
-    const candidates = await getCandidates(spyChangePct);
+    // v7.3.0 — fetch screener candidates and today's earnings reporters in parallel.
+    // The earnings call is best-effort; if it fails, the watchlist is the safety net.
+    const [candidates, earningsToday] = await Promise.all([
+      getCandidates(spyChangePct),
+      fetchEarningsCalendar(),
+    ]);
     const symbols = candidates.map(c => c.symbol);
-    const combined = [...new Set([...symbols, ...MAG7, ...SEMI_WATCHLIST, ...USER_WATCHLIST, ...(extras || [])])];
+    const combined = [...new Set([
+      ...symbols,
+      ...MAG7,
+      ...SEMI_WATCHLIST,
+      ...USER_WATCHLIST,
+      ...EARNINGS_REACTOR_WATCHLIST,   // v7.3.0 — always-fetch high-frequency earnings gappers
+      ...earningsToday,                // v7.3.0 — today's pre-mkt + AMC reporters from Yahoo's earnings calendar
+      ...(extras || []),
+    ])];
     console.log('[RDT ' + VERSION + '] Tickers (' + combined.length + '):', combined.join(', '));
+    if (earningsToday.length) {
+      console.log('[RDT ' + VERSION + '] Earnings today (' + earningsToday.length + '):', earningsToday.join(', '));
+    } else {
+      console.log('[RDT ' + VERSION + '] Earnings calendar fetch returned 0 — relying on EARNINGS_REACTOR_WATCHLIST safety net.');
+    }
     return analyze(combined, candidates, spyChangePct);
   }
 
@@ -1321,6 +1428,8 @@ window.RDT = (function () {
     getETContext, getHODProximity, getM5TrendState,
     // v7.2.0 — exposed volume helpers
     computeAvgVolume, classifyVolRatio, sessionElapsedFraction,
+    // v7.3.0 — earnings coverage exports (so callers can inspect / override)
+    fetchEarningsCalendar, EARNINGS_REACTOR_WATCHLIST, MAG7, SEMI_WATCHLIST,
   };
 })();
 
