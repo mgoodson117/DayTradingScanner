@@ -1,5 +1,5 @@
 /**
- * Day Trading Scanner v7
+ * Day Trading Scanner v8
  * ─────────────────────────────────────────────────────────────────────────────
  * Hosted at: github.com/mgoodson117/DayTradingScanner
  * CDN:       https://cdn.jsdelivr.net/gh/mgoodson117/DayTradingScanner@main/market_data.js
@@ -8,6 +8,42 @@
  *   window.RDT.run()                 → full auto-scan (gainers + losers + actives + Mag7 + watchlists + earnings)
  *   window.RDT.analyze([...tickers]) → analyze a specific list
  *   window.RDT.summary()             → formatted output after either call
+ *
+ * v8.0.0 CHANGES vs v7.3.0 — PHASE 1 PLAYBOOK FIELDS (from the May 12, 2026 trade-rec
+ * evaluation that produced +5.22R over 2 weeks via M5 intraday backtest):
+ *
+ *   1. DAY-TRADE T1 = 0.5×ATR  (was 1×ATR). For tradeType='D' setups, the
+ *      synthetic-T1 default is now half the prior distance. Scanner emits BOTH
+ *      `t1DaySynthetic` (entry ± 0.5×ATR) and `t1SwingSynthetic` (entry ± 1×ATR)
+ *      so the report-generation step picks the correct one per trade type.
+ *      Rationale: 40% of day trades ended CHOP on M5 with 1×ATR T1; halving the
+ *      target distance flipped 7 of those to T1 wins over 2 weeks.
+ *
+ *   2. DUAL ENTRY TRIGGER — every setup emits a `breakoutLong` (HOD × 1.0005)
+ *      and `breakoutShort` (LOD × 0.9995) level alongside the existing pullback
+ *      VWAP entry. Used by the report to render BOTH an Entry-A (pullback,
+ *      expires 12 PM ET) and Entry-B (breakout, vol-gated) condition.
+ *      Rescued 7 NO_TRIG → T1 over 2 weeks (continuation-move recoveries).
+ *
+ *   3. CONVICTION PENALTIES — multiplied into compositeScoreV8:
+ *      - extensionPenalty = clamp(1.5 − (price − SMA20) / (3 × ATR), 0.3, 1.0)
+ *      - hodProximityPenalty = clamp((dayHigh − price) / (0.5 × ATR), 0.3, 1.0)
+ *      - stopQualityFactor = (entry − stop) ≥ 1×ATR ? 1.0 : 0.5
+ *      The original compositeScore is preserved for backward compatibility;
+ *      compositeScoreV8 is the new ranking target.
+ *
+ *   4. CLEAN_DAY QUALIFICATION GATES — exposes `cleanDayPaceOk` (paceRVol≥1.4)
+ *      and `cleanDayConfluencesOk` (cleanCount≥3) so report-generation can
+ *      enforce Phase-1 Rule 4 (catalyst verified + 3 confluences + heavy pace).
+ *      Setups failing either gate drop to the Watchlist subsection, not main Top.
+ *
+ *   5. SPY-AT-HOD/LOD BLOCK — scan output adds `spyHodBlock` and `spyLodBlock`
+ *      booleans (true when SPY within 0.20% of HOD/LOD). When set, the report
+ *      renders pullback-only entries and replaces "Top" with "Pullback Watchlist."
+ *
+ *   The scanner JS does NOT enforce these rules at scoring time — it emits the
+ *   data and the report-generation step (Claude reading `SKILL_addendum_phase1_v1.md`)
+ *   applies them. This preserves full diagnostic data for backtesting.
  *
  * v7.3.0 CHANGES vs v7.2.0 — EARNINGS COVERAGE GUARANTEE:
  *
@@ -66,7 +102,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v7.3.0';
+  const VERSION = 'v8.0.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1122,6 +1158,49 @@ window.RDT = (function () {
       ? 'Below $' + (d1.dayLow || m5?.vwap)
       : direction === 'SHORT' ? 'Above $' + rrStop + ' (' + (rrStopNote || 'day high') + ')' : null;
 
+    // ─── v8.0.0 — Phase 1 playbook fields ──────────────────────────────────
+    // Reference: Reports/SKILL_addendum_phase1_v1.md
+    const atr = d1.atr20 || 0;
+    const price = d1.price;
+    const sma20 = d1.sma20;
+    const dayHigh = d1.dayHigh;
+    const dayLow = d1.dayLow;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    // Rule 1 — Day-trade T1 = entry + 0.5×ATR; swing T1 = entry + 1×ATR
+    const t1DaySynthetic = (direction === 'SHORT')
+      ? (atr ? parseFloat((rrEntry - 0.5 * atr).toFixed(2)) : null)
+      : (atr ? parseFloat((rrEntry + 0.5 * atr).toFixed(2)) : null);
+    const t1SwingSynthetic = (direction === 'SHORT')
+      ? (atr ? parseFloat((rrEntry - 1.0 * atr).toFixed(2)) : null)
+      : (atr ? parseFloat((rrEntry + 1.0 * atr).toFixed(2)) : null);
+
+    // Rule 2 — Breakout entry levels (pre-publish HOD/LOD at scoring time)
+    // Long: 5-min close above dayHigh × 1.0005 with bar volume ≥ 1.5× session avg
+    // Short: 5-min close below dayLow × 0.9995 with bar volume ≥ 1.5× session avg
+    const breakoutLong = dayHigh ? parseFloat((dayHigh * 1.0005).toFixed(2)) : null;
+    const breakoutShort = dayLow ? parseFloat((dayLow * 0.9995).toFixed(2)) : null;
+
+    // Rule 5 — Conviction-score penalties
+    const extensionPenalty = (sma20 != null && atr > 0)
+      ? parseFloat(clamp(1.5 - (price - sma20) / (3 * atr), 0.3, 1.0).toFixed(2))
+      : 1.0;
+    const hodProximityPenalty = (dayHigh != null && atr > 0)
+      ? parseFloat(clamp((dayHigh - price) / (0.5 * atr), 0.3, 1.0).toFixed(2))
+      : 1.0;
+    const stopDist = rrStop != null ? Math.abs(rrEntry - rrStop) : 0;
+    const stopQualityFactor = (atr > 0 && stopDist >= atr) ? 1.0 : 0.5;
+
+    // Rule 4 — CLEAN_DAY qualification gates (catalyst verification added externally)
+    const cleanDayPaceOk = paceRVol != null && paceRVol >= 1.4;
+    const cleanDayConfluencesOk = cleanCount >= 3;
+
+    // v8.0.0 — composite score with new penalties stacked
+    const compositeScoreV8 = parseFloat(
+      ((cleanCount + horizWeightBonus) * rrScoreCap * haMult * ctPenalty * earningsPen
+       * extensionPenalty * hodProximityPenalty * stopQualityFactor).toFixed(2)
+    );
+
     return {
       direction, setupType, rsScore, hasRS, hasRW,
       confluences, conviction, counterTrend, counterTrendStrength,
@@ -1131,6 +1210,12 @@ window.RDT = (function () {
       brokenAlgoLines,
       // v7.2.0 — volume metrics surfaced for rendering
       paceRVol, paceRVolLabel,
+      // v8.0.0 — Phase 1 fields
+      t1DaySynthetic, t1SwingSynthetic,
+      breakoutLong, breakoutShort,
+      extensionPenalty, hodProximityPenalty, stopQualityFactor,
+      cleanDayPaceOk, cleanDayConfluencesOk,
+      compositeScoreV8,
     };
   }
 
@@ -1252,10 +1337,23 @@ window.RDT = (function () {
       })
     ]);
 
+    // v8.0.0 — SPY-at-HOD/LOD block (Phase-1 Rule 9)
+    // When SPY is within 0.20% of HOD, report-generation step must render
+    // only conditional-pullback entries; no "buy now" or breakout entries on
+    // a chase day. Mirror at LOD for short days.
+    const spyHodBlock = (spyD1 && !spyD1.error && spyD1.dayHigh && spyD1.price)
+      ? ((spyD1.dayHigh - spyD1.price) / spyD1.dayHigh) <= 0.002
+      : false;
+    const spyLodBlock = (spyD1 && !spyD1.error && spyD1.dayLow && spyD1.price)
+      ? ((spyD1.price - spyD1.dayLow) / spyD1.dayLow) <= 0.002
+      : false;
+
     window._scan = {
       version: VERSION, etCtx,
       spyChg: spyChangePct,
       spyD1, spyM5,
+      // v8.0.0 — SPY chase-risk flags
+      spyHodBlock, spyLodBlock,
       sectors: sectorBias, vix,
       tickers: tickerData,
       candidates: candidates || [],
@@ -1281,6 +1379,12 @@ window.RDT = (function () {
       // v7.2.0 — SPY-level volume read for the daily-bias block
       if (sd1.dailyRVol != null) {
         lines.push('  📊 SPY Volume — Daily RVol ' + sd1.dailyRVol + '× (' + sd1.dailyRVolLabel + ') ' + volEmoji(sd1.dailyRVol));
+      }
+      // v8.0.0 — SPY-at-HOD/LOD chase-risk warning (Phase-1 Rule 9)
+      if (s.spyHodBlock) {
+        lines.push('  ⛔ SPY within 0.20% of HOD — pullback-only entries; no breakout adds today.');
+      } else if (s.spyLodBlock) {
+        lines.push('  ⛔ SPY within 0.20% of LOD — bounce-to-VWAP short entries only; no breakdown adds today.');
       }
     }
     if (s.vix && !s.vix.error) {
@@ -1373,10 +1477,31 @@ window.RDT = (function () {
         if (av.fromRecentGap) lines.push('     aVWAP from RECENT-GAP    (' + av.anchors.recentGap   + '): $' + av.fromRecentGap);
         if (av.fromBreakout)  lines.push('     aVWAP from BREAKOUT      (' + av.anchors.breakout    + '): $' + av.fromBreakout);
       }
-      lines.push('     Entry: ' + sc.entryNote);
+      lines.push('     Entry-A (pullback): ' + sc.entryNote);
+      // v8.0.0 — dual entry trigger (Phase-1 Rule 2)
+      if (sc.direction === 'LONG' && sc.breakoutLong != null) {
+        lines.push('     Entry-B (breakout): 5m close > $' + sc.breakoutLong + ' with bar vol ≥ 1.5× session avg');
+      } else if (sc.direction === 'SHORT' && sc.breakoutShort != null) {
+        lines.push('     Entry-B (breakdown): 5m close < $' + sc.breakoutShort + ' with bar vol ≥ 1.5× session avg');
+      }
       lines.push('     Stop:  ' + sc.stopNote);
+      // v8.0.0 — emit both day-trade T1 (0.5×ATR) and swing T1 (1×ATR) plus original algo target
+      if (sc.t1DaySynthetic != null && sc.t1SwingSynthetic != null) {
+        lines.push('     T1 (day, 0.5×ATR) $' + sc.t1DaySynthetic + ' | T1 (swing, 1×ATR) $' + sc.t1SwingSynthetic);
+      }
       if (sc.rrT1) {
-        lines.push('     T1 $' + sc.rrT1 + ' (' + sc.rrT1Source + ')' + (sc.rrT2 ? ' | T2 $' + sc.rrT2 : '') + ' | R:R ' + sc.rrRatio + ':1' + (sc.poorRR ? ' ⚠️ POOR' : ''));
+        lines.push('     T1 algo: $' + sc.rrT1 + ' (' + sc.rrT1Source + ')' + (sc.rrT2 ? ' | T2 $' + sc.rrT2 : '') + ' | R:R ' + sc.rrRatio + ':1' + (sc.poorRR ? ' ⚠️ POOR' : ''));
+      }
+      // v8.0.0 — conviction penalties + CLEAN_DAY gates (Phase-1 Rule 4 + 5)
+      const penBits = [];
+      if (sc.extensionPenalty != null && sc.extensionPenalty < 1.0) penBits.push('extension ×' + sc.extensionPenalty);
+      if (sc.hodProximityPenalty != null && sc.hodProximityPenalty < 1.0) penBits.push('HOD-prox ×' + sc.hodProximityPenalty);
+      if (sc.stopQualityFactor != null && sc.stopQualityFactor < 1.0) penBits.push('stop-qual ×' + sc.stopQualityFactor);
+      if (penBits.length) lines.push('     Penalties: ' + penBits.join(' | ') + ' → ScoreV8 ' + sc.compositeScoreV8);
+      if (sc.bucket === 'CLEAN_DAY') {
+        const gateP = sc.cleanDayPaceOk ? '✅' : '❌';
+        const gateC = sc.cleanDayConfluencesOk ? '✅' : '❌';
+        lines.push('     CLEAN_DAY gates: Pace≥1.4× ' + gateP + ' | Confluences≥3 ' + gateC + ' | Catalyst-verified (external) ⏳');
       }
       lines.push('     Swing: ' + sc.swingNote);
     }
