@@ -118,7 +118,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.0.0';
+  const VERSION = 'v8.1.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
