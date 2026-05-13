@@ -1,5 +1,5 @@
 /**
- * Day Trading Scanner v8
+ * Day Trading Scanner v8.1.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Hosted at: github.com/mgoodson117/DayTradingScanner
  * CDN:       https://cdn.jsdelivr.net/gh/mgoodson117/DayTradingScanner@main/market_data.js
@@ -28,9 +28,25 @@
  *   3. CONVICTION PENALTIES — multiplied into compositeScoreV8:
  *      - extensionPenalty = clamp(1.5 − (price − SMA20) / (3 × ATR), 0.3, 1.0)
  *      - hodProximityPenalty = clamp((dayHigh − price) / (0.5 × ATR), 0.3, 1.0)
- *      - stopQualityFactor = (entry − stop) ≥ 1×ATR ? 1.0 : 0.5
+ *      - stopQualityFactor = (entry − stop) ≥ 0.3×ATR ? 1.0 : 0.5
+ *        (v8.1.0: threshold lowered from 1×ATR — prior value penalised every
+ *         valid intraday stop since most are 0.3–0.7×ATR)
  *      The original compositeScore is preserved for backward compatibility;
  *      compositeScoreV8 is the new ranking target.
+ *
+ * v8.1.0 CHANGES (2026-05-13):
+ *   A. STOP MINIMUM FLOOR — after computing rrStop for both LONG and SHORT,
+ *      enforce a minimum distance of 0.3×ATR from rrEntry. Prevents $0.01 stops
+ *      (e.g. PYPL 2026-05-12: broken support sat $0.01 above VWAP; stop rendered
+ *      as $44.93 against $44.92 entry). When widened, rrRatio is recomputed and
+ *      a "[auto-widened: min 0.3×ATR floor]" note is appended to rrStopNote.
+ *   B. LONG ENTRY ANCHOR — when M5 VWAP is unavailable (weekend / pre-market)
+ *      and d1.anchoredVWAPs.from52wHigh is below current price, use that aVWAP
+ *      as rrEntry instead of d1.price. T1/T2 targets are rebased from the aVWAP
+ *      anchor so that entry, stop, target, and R:R are all self-consistent from
+ *      the trader's perspective. Fixes WDC 2026-05-10: report showed "entry
+ *      $471.23" alongside R:R computed from spot $480 — numbers didn't add up.
+ *   C. stopQualityFactor threshold: 1×ATR → 0.3×ATR (see (3) above).
  *
  *   4. CLEAN_DAY QUALIFICATION GATES — exposes `cleanDayPaceOk` (paceRVol≥1.4)
  *      and `cleanDayConfluencesOk` (cleanCount≥3) so report-generation can
@@ -1049,7 +1065,17 @@ window.RDT = (function () {
        : 'MILD')
       : null;
 
-    const rrEntry = m5?.vwap ? parseFloat(m5.vwap) : d1.price;
+    // v8.1.0 — when no live M5 VWAP (weekend / pre-market) and an aVWAP from
+    // the 52w-high date is available below current price, use it as the pullback
+    // entry anchor so that entry, stop, and targets are all self-consistent.
+    const _aVWAPpullback = (!m5?.vwap &&
+                            d1.anchoredVWAPs?.from52wHigh != null &&
+                            parseFloat(d1.anchoredVWAPs.from52wHigh) < d1.price)
+      ? parseFloat(d1.anchoredVWAPs.from52wHigh)
+      : null;
+    const rrEntry = m5?.vwap
+      ? parseFloat(m5.vwap)
+      : (_aVWAPpullback != null ? _aVWAPpullback : d1.price);
     let rrStop, rrT1, rrT2, rrRatio, rrStopNote, rrT1Source;
     const algoAbove = (d1.algoLines || []).filter(l => l.above).sort((a, b) => a.level - b.level);
     const algoBelow = (d1.algoLines || []).filter(l => !l.above).sort((a, b) => b.level - a.level);
@@ -1066,6 +1092,13 @@ window.RDT = (function () {
         rrT1 = algoAbove[0].level;
         rrT2 = algoAbove.length > 1 ? algoAbove[1].level : null;
         rrT1Source = 'nearest algo resistance';
+      }
+      // v8.1.0 — when entry is an aVWAP pullback (not current spot), rebase
+      // T1/T2 from that entry so all numbers are self-consistent.
+      if (_aVWAPpullback != null && d1.atr20) {
+        rrT1 = parseFloat((_aVWAPpullback + 1.0 * d1.atr20).toFixed(2));
+        rrT2 = parseFloat((_aVWAPpullback + 2.0 * d1.atr20).toFixed(2));
+        rrT1Source = 'aVWAP $' + _aVWAPpullback + ' + 1×ATR(' + d1.atr20 + ')';
       }
       if (rrT1 && rrStop && risk) {
         const reward = rrT1 - rrEntry;
@@ -1095,6 +1128,32 @@ window.RDT = (function () {
       if (rrT1 && rrStop && rrEntry < rrStop) {
         const risk = rrStop - rrEntry, reward = rrEntry - rrT1;
         rrRatio = reward > 0 && risk > 0 ? parseFloat((reward / risk).toFixed(1)) : null;
+      }
+    }
+
+    // v8.1.0 — enforce minimum stop distance of 0.3×ATR from entry for both
+    // directions. Prevents unusable stops caused by support/resistance levels
+    // sitting within a few cents of the entry (e.g. PYPL 2026-05-12 $0.01 stop).
+    // When the floor fires: stop is widened, rrRatio is recomputed, and a note
+    // is appended so reports can flag the adjustment.
+    const _atrFloor = d1.atr20 || 0;
+    if (_atrFloor > 0 && rrStop != null) {
+      if ((direction === 'LONG' || setupType === 'WAIT_VWAP_RECLAIM') &&
+          (rrEntry - rrStop) < 0.3 * _atrFloor) {
+        rrStop = parseFloat((rrEntry - 0.3 * _atrFloor).toFixed(2));
+        rrStopNote = (rrStopNote || 'stop') + ' [auto-widened: min 0.3×ATR floor]';
+        if (rrT1 != null) {
+          const risk2 = rrEntry - rrStop, reward2 = rrT1 - rrEntry;
+          rrRatio = (reward2 > 0 && risk2 > 0) ? parseFloat((reward2 / risk2).toFixed(1)) : null;
+        }
+      } else if (direction === 'SHORT' &&
+                 (rrStop - rrEntry) < 0.3 * _atrFloor) {
+        rrStop = parseFloat((rrEntry + 0.3 * _atrFloor).toFixed(2));
+        rrStopNote = (rrStopNote || 'stop') + ' [auto-widened: min 0.3×ATR floor]';
+        if (rrT1 != null) {
+          const risk2 = rrStop - rrEntry, reward2 = rrEntry - rrT1;
+          rrRatio = (reward2 > 0 && risk2 > 0) ? parseFloat((reward2 / risk2).toFixed(1)) : null;
+        }
       }
     }
 
@@ -1189,7 +1248,11 @@ window.RDT = (function () {
       ? parseFloat(clamp((dayHigh - price) / (0.5 * atr), 0.3, 1.0).toFixed(2))
       : 1.0;
     const stopDist = rrStop != null ? Math.abs(rrEntry - rrStop) : 0;
-    const stopQualityFactor = (atr > 0 && stopDist >= atr) ? 1.0 : 0.5;
+    // v8.1.0 — threshold lowered from 1×ATR to 0.3×ATR. The prior threshold
+    // halved the score on virtually every valid intraday setup (most intraday
+    // stops are 0.3–0.7×ATR). A stop < 0.3×ATR still scores 0.5 as a penalty
+    // signal, but valid tight stops no longer get unfairly penalised.
+    const stopQualityFactor = (atr > 0 && stopDist >= 0.3 * atr) ? 1.0 : 0.5;
 
     // Rule 4 — CLEAN_DAY qualification gates (catalyst verification added externally)
     const cleanDayPaceOk = paceRVol != null && paceRVol >= 1.4;
