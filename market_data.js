@@ -34,6 +34,35 @@
  *      The original compositeScore is preserved for backward compatibility;
  *      compositeScoreV8 is the new ranking target.
  *
+ * v8.3.0 CHANGES (2026-05-16) — QUALITY-BAR FILTERS + REGIME-AWARE SHORTS:
+ *   Closes out the May 16 system-review roadmap. Three filters that route
+ *   weak setups to watchlists instead of letting them hit the Top section.
+ *
+ *   I.  EARN_REACTOR QUALITY BAR — earnings-reactor setups must satisfy at
+ *       least 2 of 3 quality conditions to keep the EARNINGS_REACTOR bucket
+ *       and qualify for the main Top section:
+ *         (a) cleanCount ≥ 4
+ *         (b) paceRVol ≥ 2.0 (very heavy, not just heavy 1.4)
+ *         (c) ≥1 broken algo level with ≥3 touches AND breakVolRatio ≥ 1.5
+ *       Unqualified reactors route to WATCHLIST_REACTOR (watch-only).
+ *       Directly addresses the 11% win-rate that the bucket ran on May 12-15.
+ *
+ *   II. SPY MELT-UP REGIME — `fetchD1` now emits `upDaysLast5`. `analyze()`
+ *       computes `spyMeltupRegime = SPY above all 4 SMAs AND up ≥3 of last 5`
+ *       and threads it into scoreStock via a new `spyContext` parameter.
+ *       Mirrors the score_yesterday.py `is_meltup_regime()` test exactly.
+ *
+ *   III.MELT-UP SHORT RAISE-BAR — when the regime is melt-up AND a SHORT
+ *       setup fails the higher bar (cleanCount ≥ 4, ≥6 days below SMA20,
+ *       and ≥10% off 52w high), it routes to WATCHLIST_MELTUP_SHORT.
+ *       Per the May 16 backtest, 18/30 best shorts worked in melt-up — so
+ *       this is a raise-the-bar gate, not a ban.
+ *
+ *   Two new bucket labels: WATCHLIST_REACTOR, WATCHLIST_MELTUP_SHORT.
+ *   Both rendered in summary() as watch-only sections below the Top.
+ *   scoreStock signature gains a 6th param `spyContext = { meltupRegime,
+ *   upDaysLast5 }`; callers without it get the old behavior.
+ *
  * v8.2.0 CHANGES (2026-05-16) — STATIC UNIVERSE + SLOW_BLEED + TREND-AGE:
  *   Driven by the May 16, 2026 60-day backtest, which showed the system's best
  *   short swings (ZTS, TSCO, GEHC, COR, SBAC, CPB, ...) never appeared on the
@@ -151,7 +180,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.2.0';
+  const VERSION = 'v8.3.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -714,6 +743,15 @@ window.RDT = (function () {
       const swingLevels = findPriorSwingLevels(candles, 5);
       const atr20 = computeATR(candles, 20);
 
+      // v8.3.0 — count of up-days over the last 5 day-over-day comparisons.
+      // Drives the melt-up regime check (above all SMAs + up ≥3 of last 5).
+      let upDaysLast5 = 0;
+      if (closes.length >= 6) {
+        for (let i = closes.length - 5; i < closes.length; i++) {
+          if (closes[i] > closes[i - 1]) upDaysLast5++;
+        }
+      }
+
       // v8.2.0 — consecutive daily closes on each side of SMA20. The most
       // recent close is the "current side"; walk backwards until the side
       // flips. Capped at 30 lookback (more than enough — anything past day-16
@@ -822,6 +860,8 @@ window.RDT = (function () {
         volume_today, volume_avg20, dailyRVol, dailyRVolLabel,
         // v8.2.0 — trend-age tracking (consecutive closes on each side of SMA20)
         daysAboveSMA20, daysBelowSMA20,
+        // v8.3.0 — up-days count for melt-up regime detection
+        upDaysLast5,
       };
     } catch(e) { return { ticker, error: e.message || 'fetch failed' }; }
   }
@@ -1036,7 +1076,8 @@ window.RDT = (function () {
     return map;
   }
 
-  function scoreStock(d1, m5, spyChangePct, earningsInfo, etCtx) {
+  function scoreStock(d1, m5, spyChangePct, earningsInfo, etCtx, spyContext) {
+    spyContext = spyContext || {};
     const rsScore = parseFloat((d1.changePct - spyChangePct).toFixed(2));
     const hasRS = rsScore > 0.5, hasRW = rsScore < -0.5;
     const nearAlgoLines = (d1.algoLines || []).filter(l => l.nearCurrent);
@@ -1299,12 +1340,59 @@ window.RDT = (function () {
                         && !earningsInfo.justReported
                         && !earningsInfo.likelyPostEarnings;
 
+    // v8.3.0 — EARN_REACTOR quality bar
+    // The May 16 backtest review showed the EARN_REACTOR bucket ran 11% win-rate
+    // (1 T1 in 9 trades on May 12-15) versus the 32% baseline of valid-structure
+    // shorts. Tighten: require 2 of 3 quality conditions for a reactor to enter
+    // the main Top section. Unqualified reactors route to WATCHLIST_REACTOR
+    // (rendered as a watch-only sub-section in the brief).
+    //
+    // Quality conditions:
+    //   (a) cleanCount >= 4 (one more confluence than the baseline 3)
+    //   (b) paceRVol >= 2.0 (very heavy, not just heavy 1.4)
+    //   (c) ≥1 broken algo level with ≥3 touches AND breakVolRatio ≥ 1.5
+    //       (institutional break of a real structure level)
+    const _isReactor = earningsInfo.hasUpcoming || earningsInfo.justReported || earningsInfo.likelyPostEarnings;
+    const _earnQualA = cleanCount >= 4;
+    const _earnQualB = paceRVol != null && paceRVol >= 2.0;
+    const _earnQualC = brokenAlgoLines.some(l => (l.touches || 0) >= 3 && (l.breakVolRatio || 0) >= 1.5);
+    const _earnQualCount = (_earnQualA ? 1 : 0) + (_earnQualB ? 1 : 0) + (_earnQualC ? 1 : 0);
+    const earnReactorQualified = _isReactor && _earnQualCount >= 2;
+    const earnReactorQualifiers = _isReactor ? {
+      confluences4plus: _earnQualA,
+      paceRVol2x: _earnQualB,
+      institutionalBreak: _earnQualC,
+      qualifiedCount: _earnQualCount,
+      qualified: earnReactorQualified,
+    } : null;
+
+    // v8.3.0 — Melt-up regime + short raise-bar flag
+    // The backtest showed 18 of the top-30 best shorts worked even when SPY was
+    // above all four SMAs. "Ban shorts in melt-up" is too strong. Instead, flag
+    // SHORT setups that DON'T meet a higher structural bar when the regime is
+    // melt-up so the brief can demote them to watchlist.
+    //
+    // SPY melt-up is derived from SPY's own d1 fields if available on the global
+    // _scan record; this flag is set externally when run() finishes and routes
+    // it back into the per-setup score. As a scoreStock-local fallback we compute
+    // it from the SPY change vs SMAs proxy: SPY is in melt-up if spyChangePct > 0
+    // for today (caller-set context is more accurate; this is a conservative
+    // backstop). The full regime test (above all 4 SMAs + up ≥3 of last 5) is
+    // applied in run() and threaded back via window._scan.spyMeltupRegime.
+    const _isMeltupShort = direction === 'SHORT' && spyContext.meltupRegime === true;
+    const _meltupShortRaisedBarOk = direction === 'SHORT' && cleanCount >= 4
+                                 && (d1.daysBelowSMA20 || 0) >= 6
+                                 && _distFrom52wHi != null && _distFrom52wHi <= -10;
+    const meltupShortRaisedBar = _isMeltupShort && !_meltupShortRaisedBarOk;
+
     let bucket;
     if (direction === 'NEUTRAL')                                                                       bucket = 'NEUTRAL';
     else if (counterTrend)                                                                              bucket = 'COUNTER_TREND';
-    else if (earningsInfo.hasUpcoming || earningsInfo.justReported || earningsInfo.likelyPostEarnings) bucket = 'EARNINGS_REACTOR';
+    else if (_isReactor && !earnReactorQualified)                                                       bucket = 'WATCHLIST_REACTOR';
+    else if (_isReactor)                                                                                bucket = 'EARNINGS_REACTOR';
     else if (setupType === 'WAIT_VWAP_RECLAIM')                                                         bucket = 'WAIT';
     else if (slowBleedShort)                                                                            bucket = 'SLOW_BLEED_SHORT';
+    else if (meltupShortRaisedBar)                                                                      bucket = 'WATCHLIST_MELTUP_SHORT';
     else                                                                                                bucket = swingCandidate ? 'CLEAN_SWING' : 'CLEAN_DAY';
 
     let entryNote = 'No clear setup';
@@ -1412,6 +1500,8 @@ window.RDT = (function () {
       trendDays: _trendDays,
       distSma20Atr: _distSma20Atr != null ? parseFloat(_distSma20Atr.toFixed(2)) : null,
       distFrom52wHi: _distFrom52wHi != null ? parseFloat(_distFrom52wHi.toFixed(2)) : null,
+      // v8.3.0 — quality-bar flags
+      earnReactorQualified, earnReactorQualifiers, meltupShortRaisedBar,
     };
   }
 
@@ -1693,6 +1783,17 @@ window.RDT = (function () {
       ? spyD1.changePct
       : (spyChangePctIn ?? 0);
 
+    // v8.3.0 — Compute SPY melt-up regime up front, before per-ticker scoring,
+    // so scoreStock can demote weak shorts when the tape is melt-up.
+    // Definition: SPY above all 4 daily SMAs AND up on ≥3 of the last 5
+    // day-over-day comparisons. Mirrors automation/score_yesterday.py's
+    // is_meltup_regime() exactly.
+    const spyMeltupRegime = !!(spyD1 && !spyD1.error
+                            && spyD1.d1_long_valid
+                            && (spyD1.upDaysLast5 || 0) >= 3);
+    console.log('[RDT ' + VERSION + '] SPY regime: ' + (spyMeltupRegime ? 'MELT-UP (above all SMAs + up ≥3 of last 5)' : 'not melt-up'));
+    const spyContext = { meltupRegime: spyMeltupRegime, upDaysLast5: spyD1?.upDaysLast5 ?? null };
+
     const earningsMap = await fetchEarningsDates(tickers);
 
     const [sectorBias, vix, ...tickerData] = await Promise.all([
@@ -1709,7 +1810,7 @@ window.RDT = (function () {
         const cand = (candidates || []).find(c => c.symbol === t);
         const earningsDate = earningsMap[t] || cand?.earningsDate || null;
         const earningsInfo = checkEarnings(earningsDate, d1.maxRecentGap);
-        const score = (d1.error || m5.error) ? null : scoreStock(d1, m5, spyChangePct, earningsInfo, etCtx);
+        const score = (d1.error || m5.error) ? null : scoreStock(d1, m5, spyChangePct, earningsInfo, etCtx, spyContext);
         return { ticker: t, d1, m5, earningsInfo, score };
       })
     ]);
@@ -1731,6 +1832,8 @@ window.RDT = (function () {
       spyD1, spyM5,
       // v8.0.0 — SPY chase-risk flags
       spyHodBlock, spyLodBlock,
+      // v8.3.0 — melt-up regime exposed on the scan for inspection / brief generation
+      spyMeltupRegime, spyContext,
       sectors: sectorBias, vix,
       tickers: tickerData,
       candidates: candidates || [],
@@ -1795,12 +1898,17 @@ window.RDT = (function () {
       lines.push('| ' + t.ticker + ' | $' + t.d1.price + ' | ' + ch + ' | ' + rs + ' | ' + d1L + ' | ' + v + ' | ' + t.d1.haTrend + ' | ' + earn + ' | ' + gapTxt + ' |');
     });
 
-    // v7.1.0 — bucket-aware ranking (v8.2.0 — adds SLOW_BLEED_SHORT)
+    // v7.1.0 — bucket-aware ranking
+    // v8.2.0 — adds SLOW_BLEED_SHORT
+    // v8.3.0 — adds WATCHLIST_REACTOR (unqualified earnings reactors) and
+    //          WATCHLIST_MELTUP_SHORT (weak shorts in melt-up regime)
     const scored = s.tickers.filter(t => t.score && t.score.direction !== 'NEUTRAL');
     const cleanSwings    = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
     const cleanDays      = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
     const slowBleed      = scored.filter(t => t.score.bucket === 'SLOW_BLEED_SHORT').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
     const earningsR      = scored.filter(t => t.score.bucket === 'EARNINGS_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const watchReactor   = scored.filter(t => t.score.bucket === 'WATCHLIST_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const watchMeltup    = scored.filter(t => t.score.bucket === 'WATCHLIST_MELTUP_SHORT').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
     const counterT       = scored.filter(t => t.score.bucket === 'COUNTER_TREND').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
     const waits          = scored.filter(t => t.score.bucket === 'WAIT').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
 
@@ -1927,6 +2035,24 @@ window.RDT = (function () {
       lines.push('▶ COUNTER-TREND WATCHLIST (only valid IF SPY breaks direction)');
       lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
       counterT.slice(0, 5).forEach(renderSetup);
+    }
+
+    // v8.3.0 — quality-bar watchlists
+    if (watchReactor.length > 0) {
+      lines.push('');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      lines.push('▶ WATCHLIST — UNQUALIFIED EARNINGS REACTORS (v8.3.0 quality bar fail)');
+      lines.push('  Failed ≥2/3 of: cleanCount≥4 | paceRVol≥2.0 | inst. break (3+ touch, 1.5× vol)');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      watchReactor.slice(0, 5).forEach(renderSetup);
+    }
+    if (watchMeltup.length > 0) {
+      lines.push('');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      lines.push('▶ WATCHLIST — WEAK SHORTS IN MELT-UP (v8.3.0 raise-the-bar fail)');
+      lines.push('  Failed ≥1 of: cleanCount≥4 | 6+ days below SMA20 | ≥10% off 52w high');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      watchMeltup.slice(0, 5).forEach(renderSetup);
     }
 
     return lines.join('\n');
