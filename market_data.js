@@ -34,6 +34,39 @@
  *      The original compositeScore is preserved for backward compatibility;
  *      compositeScoreV8 is the new ranking target.
  *
+ * v8.2.0 CHANGES (2026-05-16) — STATIC UNIVERSE + SLOW_BLEED + TREND-AGE:
+ *   Driven by the May 16, 2026 60-day backtest, which showed the system's best
+ *   short swings (ZTS, TSCO, GEHC, COR, SBAC, CPB, ...) never appeared on the
+ *   Yahoo `day_gainers/day_losers` screens — they're slow multi-week
+ *   breakdowns, not single-day gappers. Three architectural changes:
+ *
+ *   I.  STATIC UNIVERSE SCAN — companion file `constituents.js` defines a
+ *       ~525-name S&P 500 + Nasdaq 100 universe at `window.RDT_CONSTITUENTS`.
+ *       New `fetchD1Universe()` runs a concurrency-limited daily fetch over
+ *       the whole universe (with a 4-hour localStorage cache) and a
+ *       `prescreenUniverse()` filter returns structurally-aligned candidates
+ *       (slow-bleed shorts and clean-trend longs). These are merged into the
+ *       existing screener + earnings + watchlist ticker pool inside `run()`.
+ *
+ *   II. SLOW_BLEED_SHORT bucket — added to scoreStock(). A new bucket for
+ *       names below all 4 SMAs, 5–12 consecutive days below SMA20, within
+ *       1.5×ATR of SMA20 (not extended), with mild RW (−0.5% to −8% vs SPY).
+ *       Catches the backtest's top-30 short signature directly.
+ *
+ *   III.TREND-AGE MULTIPLIER on compositeScoreV8 — multiplies the score by
+ *       1.25 when the setup is in the day-6-to-10 sweet spot of its trend
+ *       (per the 500-trade win-rate curve), 1.10 for day 11–15, 0.85 for
+ *       day 3–5 ("pause" zone), and 0.75 for day 16+ ("burned out").
+ *       fetchD1 now emits `daysAboveSMA20` and `daysBelowSMA20` to enable.
+ *
+ *   No scanner-side changes for the new SLOW_BLEED bucket are needed in the
+ *   brief format — the report generator routes SLOW_BLEED_SHORT names into
+ *   the Top section under the existing CLEAN_SWING/CLEAN_DAY format (it's
+ *   just a different bucket label for ranking + display).
+ *
+ *   Constituents file is independent of scanner version; bump
+ *   constituents.js LAST_UPDATED on each quarterly rebalance.
+ *
  * v8.1.0 CHANGES (2026-05-13):
  *   A. STOP MINIMUM FLOOR — after computing rrStop for both LONG and SHORT,
  *      enforce a minimum distance of 0.3×ATR from rrEntry. Prevents $0.01 stops
@@ -118,7 +151,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.1.0';
+  const VERSION = 'v8.2.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -152,6 +185,24 @@ window.RDT = (function () {
     // Biotech / pharma frequent gappers
     'LLY', 'NVO', 'MRNA', 'BNTX', 'AXSM', 'VRTX',
   ];
+
+  // v8.2.0 — Static universe (S&P 500 + Nasdaq 100 union, ~525 names) pulled
+  // from the companion file `constituents.js`. Loaded BEFORE market_data.js,
+  // it sets window.RDT_CONSTITUENTS. Empty array fallback so the scanner still
+  // works without the companion file — it just won't run the universe pass.
+  const STATIC_UNIVERSE =
+    (typeof window !== 'undefined' && window.RDT_CONSTITUENTS && window.RDT_CONSTITUENTS.universe)
+      ? window.RDT_CONSTITUENTS.universe
+      : [];
+  const CONSTITUENTS_VERSION =
+    (typeof window !== 'undefined' && window.RDT_CONSTITUENTS && window.RDT_CONSTITUENTS.version)
+      ? window.RDT_CONSTITUENTS.version
+      : 'NOT_LOADED';
+
+  // v8.2.0 — universe-fetch concurrency + cache settings
+  const UNIVERSE_FETCH_CONCURRENCY = 15;
+  const UNIVERSE_CACHE_TTL_MS = 4 * 60 * 60 * 1000;  // 4 hours
+  const UNIVERSE_MIN_AVG_VOLUME = 1_000_000;          // mirrors the Phase-1 liquidity floor
 
   const MIN_MKTCAP = 2e9;
   const SCREENER_URL = 'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&count=30&scrIds=';
@@ -663,6 +714,35 @@ window.RDT = (function () {
       const swingLevels = findPriorSwingLevels(candles, 5);
       const atr20 = computeATR(candles, 20);
 
+      // v8.2.0 — consecutive daily closes on each side of SMA20. The most
+      // recent close is the "current side"; walk backwards until the side
+      // flips. Capped at 30 lookback (more than enough — anything past day-16
+      // is "burned out" per the May 2026 backtest's win-rate curve).
+      let daysAboveSMA20 = 0, daysBelowSMA20 = 0;
+      {
+        const SMA20_LOOKBACK_CAP = 30;
+        const SMA_WINDOW = 20;
+        const start = Math.max(SMA_WINDOW - 1, closes.length - SMA20_LOOKBACK_CAP);
+        for (let i = closes.length - 1; i >= start; i--) {
+          // SMA20 at index i = avg of closes[i-19 .. i]
+          const w = closes.slice(i - SMA_WINDOW + 1, i + 1);
+          if (w.length < SMA_WINDOW) break;
+          const smaAtI = w.reduce((a, b) => a + b, 0) / SMA_WINDOW;
+          const c = closes[i];
+          if (c > smaAtI) {
+            if (daysAboveSMA20 === 0 && daysBelowSMA20 === 0) daysAboveSMA20 = 1;
+            else if (daysAboveSMA20 > 0) daysAboveSMA20++;
+            else break;
+          } else if (c < smaAtI) {
+            if (daysAboveSMA20 === 0 && daysBelowSMA20 === 0) daysBelowSMA20 = 1;
+            else if (daysBelowSMA20 > 0) daysBelowSMA20++;
+            else break;
+          } else {
+            break;  // exactly on SMA — stop the streak
+          }
+        }
+      }
+
       // v7.2.0 — daily RVOL (today's full-day volume vs 20-day average,
       // excluding today). For mid-session this is "today so far", which
       // the scoreStock pace-RVol calc adjusts for elapsed-fraction.
@@ -740,6 +820,8 @@ window.RDT = (function () {
         maxRecentGap,
         // v7.2.0 — volume awareness
         volume_today, volume_avg20, dailyRVol, dailyRVolLabel,
+        // v8.2.0 — trend-age tracking (consecutive closes on each side of SMA20)
+        daysAboveSMA20, daysBelowSMA20,
       };
     } catch(e) { return { ticker, error: e.message || 'fetch failed' }; }
   }
@@ -1192,11 +1274,37 @@ window.RDT = (function () {
                         && Math.abs(rsScore) >= 1
                         && (direction === 'LONG' || direction === 'SHORT');
 
+    // v8.2.0 — SLOW_BLEED_SHORT bucket detection (per May 2026 backtest signature)
+    // Matches the structural pattern that produced the top 30 short swings in
+    // the 60-day backtest: below all SMAs, 5–12 days below SMA20, within
+    // 1.5×ATR of SMA20, mild RW, 5–35% off 52-week high.
+    const _atrLocal = d1.atr20 || 0;
+    const _distSma20Atr = (_atrLocal > 0 && d1.sma20 != null)
+      ? (d1.price - d1.sma20) / _atrLocal
+      : null;
+    const _distFrom52wHi = (d1.fiftyTwoWeekHigh > 0)
+      ? (d1.price / d1.fiftyTwoWeekHigh - 1) * 100
+      : null;
+    const slowBleedShort = direction === 'SHORT'
+                        && d1.aboveSma100 === false
+                        && d1.aboveSma200 === false
+                        && d1.daysBelowSMA20 != null
+                        && d1.daysBelowSMA20 >= 5 && d1.daysBelowSMA20 <= 12
+                        && _distSma20Atr != null
+                        && _distSma20Atr >= -1.5 && _distSma20Atr < 0
+                        && rsScore <= -0.5 && rsScore >= -8
+                        && _distFrom52wHi != null
+                        && _distFrom52wHi <= -5 && _distFrom52wHi >= -35
+                        && !earningsInfo.hasUpcoming
+                        && !earningsInfo.justReported
+                        && !earningsInfo.likelyPostEarnings;
+
     let bucket;
     if (direction === 'NEUTRAL')                                                                       bucket = 'NEUTRAL';
     else if (counterTrend)                                                                              bucket = 'COUNTER_TREND';
     else if (earningsInfo.hasUpcoming || earningsInfo.justReported || earningsInfo.likelyPostEarnings) bucket = 'EARNINGS_REACTOR';
     else if (setupType === 'WAIT_VWAP_RECLAIM')                                                         bucket = 'WAIT';
+    else if (slowBleedShort)                                                                            bucket = 'SLOW_BLEED_SHORT';
     else                                                                                                bucket = swingCandidate ? 'CLEAN_SWING' : 'CLEAN_DAY';
 
     let entryNote = 'No clear setup';
@@ -1258,10 +1366,30 @@ window.RDT = (function () {
     const cleanDayPaceOk = paceRVol != null && paceRVol >= 1.4;
     const cleanDayConfluencesOk = cleanCount >= 3;
 
+    // v8.2.0 — Trend-age multiplier (per May 2026 backtest win-rate curve).
+    // The win rate by days-on-trend-side, on 500 valid short setups, was:
+    //   1–3 days:  38.0%  (fresh — mixed)
+    //   4–5 days:  28.9%  (pause — worst)
+    //   6–7 days:  52.4%  (best — second-leg confirmation)
+    //   8–10 days: 45.6%  (continuation)
+    //   11–15 days:38.4%  (late)
+    //   16+ days:  28.4%  (burned out)
+    // Multiplier reflects the curve: boost the sweet-spot, demote the burned-out.
+    const _trendDays = direction === 'SHORT' ? (d1.daysBelowSMA20 || 0)
+                     : direction === 'LONG'  ? (d1.daysAboveSMA20 || 0)
+                     : 0;
+    const trendAgeMultiplier =
+        (_trendDays >= 6  && _trendDays <= 10) ? 1.25
+      : (_trendDays >= 11 && _trendDays <= 15) ? 1.10
+      : (_trendDays >= 3  && _trendDays <=  5) ? 0.85
+      : (_trendDays >= 16)                     ? 0.75
+      :                                          1.00;
+
     // v8.0.0 — composite score with new penalties stacked
+    // v8.2.0 — trendAgeMultiplier added to the chain
     const compositeScoreV8 = parseFloat(
       ((cleanCount + horizWeightBonus) * rrScoreCap * haMult * ctPenalty * earningsPen
-       * extensionPenalty * hodProximityPenalty * stopQualityFactor).toFixed(2)
+       * extensionPenalty * hodProximityPenalty * stopQualityFactor * trendAgeMultiplier).toFixed(2)
     );
 
     return {
@@ -1279,6 +1407,11 @@ window.RDT = (function () {
       extensionPenalty, hodProximityPenalty, stopQualityFactor,
       cleanDayPaceOk, cleanDayConfluencesOk,
       compositeScoreV8,
+      // v8.2.0 — slow-bleed + trend-age fields
+      slowBleedShort, trendAgeMultiplier,
+      trendDays: _trendDays,
+      distSma20Atr: _distSma20Atr != null ? parseFloat(_distSma20Atr.toFixed(2)) : null,
+      distFrom52wHi: _distFrom52wHi != null ? parseFloat(_distFrom52wHi.toFixed(2)) : null,
     };
   }
 
@@ -1289,6 +1422,152 @@ window.RDT = (function () {
   // `finance.yahoo.com/calendar/earnings` HTML embed first and fall back to the
   // visualization endpoint. On any failure we silently return [] so the
   // watchlist is the durable safety net.
+  // v8.2.0 — Universe pre-screen helpers ─────────────────────────────────────
+  //
+  // The Yahoo gainers/losers/most-actives screeners surface only stocks that
+  // are already moving >2–5% today. They miss the slow-bleed shorts that took
+  // 1–2 weeks to set up (ZTS, TSCO, GEHC, COR, ... per the May 2026 backtest).
+  // These helpers fetch D1 for the full STATIC_UNIVERSE in parallel and apply
+  // structural filters to surface those names before the catalyst hunt.
+  //
+  // Cache: localStorage with a 4-hour TTL keyed by YYYY-MM-DD. The pre-open
+  // run (8:30 AM ET) pays the universe-fetch cost; subsequent intraday scans
+  // read cache.
+
+  function _universeCacheKey() {
+    const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const yyyy = et.getFullYear();
+    const mm = String(et.getMonth() + 1).padStart(2, '0');
+    const dd = String(et.getDate()).padStart(2, '0');
+    return 'rdt_d1_universe_' + yyyy + '-' + mm + '-' + dd;
+  }
+
+  function _pruneOlderUniverseCache(currentKey) {
+    try {
+      const keysToRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('rdt_d1_universe_') && k !== currentKey) keysToRemove.push(k);
+      }
+      keysToRemove.forEach(k => localStorage.removeItem(k));
+    } catch (e) { /* silently ignore */ }
+  }
+
+  async function fetchD1Universe(tickers, opts) {
+    opts = opts || {};
+    const concurrency = opts.concurrency || UNIVERSE_FETCH_CONCURRENCY;
+    const useCache    = opts.useCache !== false;
+
+    const cacheKey = _universeCacheKey();
+    let cached = {};
+    if (useCache) {
+      try {
+        const raw = localStorage.getItem(cacheKey);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.ts && (Date.now() - parsed.ts) < UNIVERSE_CACHE_TTL_MS) {
+            cached = parsed.data || {};
+          }
+        }
+      } catch (e) { /* corrupt cache — ignore */ }
+    }
+
+    const toFetch = tickers.filter(t => !(t in cached));
+    if (toFetch.length === 0) {
+      console.log('[RDT ' + VERSION + '] Universe cache HIT (' + tickers.length + ' tickers, fresh < ' + (UNIVERSE_CACHE_TTL_MS / 3.6e6).toFixed(1) + 'h).');
+      return cached;
+    }
+    console.log('[RDT ' + VERSION + '] Universe fetch: ' + toFetch.length + ' tickers (concurrency=' + concurrency + ') — cache hits ' + (tickers.length - toFetch.length) + '.');
+
+    const t0 = Date.now();
+    const results = Object.assign({}, cached);
+    const queue = toFetch.slice();
+    let completed = 0, failed = 0;
+
+    const worker = async () => {
+      while (queue.length > 0) {
+        const ticker = queue.shift();
+        if (!ticker) break;
+        try {
+          const d1 = await fetchD1(ticker);
+          if (d1 && !d1.error) results[ticker] = d1;
+          else failed++;
+        } catch (e) {
+          failed++;
+        }
+        completed++;
+      }
+    };
+    await Promise.all(Array(concurrency).fill(0).map(() => worker()));
+
+    if (useCache) {
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({ ts: Date.now(), data: results }));
+        _pruneOlderUniverseCache(cacheKey);
+      } catch (e) {
+        // localStorage might be full or in private-mode — best-effort
+        console.warn('[RDT ' + VERSION + '] Universe cache write failed: ' + e.message);
+      }
+    }
+    console.log('[RDT ' + VERSION + '] Universe fetch done: ' + completed + ' done, ' + failed + ' failed, ' +
+                ((Date.now() - t0) / 1000).toFixed(1) + 's elapsed.');
+    return results;
+  }
+
+  // v8.2.0 — Structural pre-screen on the universe D1 map.
+  // Returns { tickers: [...], bySource: { slowBleedShort: [...], cleanLong: [...] } }
+  //
+  // Filter A — SLOW_BLEED_SHORT (per May 2026 backtest top-30 short signature):
+  //   - below all 4 daily SMAs
+  //   - 5..12 consecutive days below SMA20 (sweet spot 6..10)
+  //   - within 1.5×ATR of SMA20 from below (not extended)
+  //   - mild relative weakness (−0.5% to −8% vs SPY today)
+  //   - 5–35% off 52-week high
+  //   - ≥1M shares avg daily volume
+  //
+  // Filter B — CLEAN_LONG_STRUCTURAL (mirror, lighter — the current scanner
+  // already catches most of these via gainers/Mag7, but a universe pass
+  // surfaces fresh breakouts the screener might miss):
+  //   - above all 4 daily SMAs
+  //   - 5..12 consecutive days above SMA20
+  //   - positive RS vs SPY (≥+0.5%)
+  //   - ≥1M shares avg daily volume
+  function prescreenUniverse(d1Map, spyChangePct) {
+    const slowBleedShort = [];
+    const cleanLong = [];
+    for (const ticker in d1Map) {
+      const d1 = d1Map[ticker];
+      if (!d1 || d1.error) continue;
+      if (!d1.volume_avg20 || d1.volume_avg20 < UNIVERSE_MIN_AVG_VOLUME) continue;
+      if (!d1.atr20 || d1.atr20 <= 0) continue;
+      if (d1.fiftyTwoWeekHigh == null || d1.sma20 == null) continue;
+
+      const rsVsSpy = d1.changePct - spyChangePct;
+      const distSma20Atr = (d1.price - d1.sma20) / d1.atr20;
+      const distFrom52wHi = (d1.price / d1.fiftyTwoWeekHigh - 1) * 100;
+
+      // Filter A — SLOW_BLEED_SHORT
+      if (d1.d1_short_valid && !d1.aboveSma100 && !d1.aboveSma200
+          && d1.daysBelowSMA20 >= 5 && d1.daysBelowSMA20 <= 12
+          && distSma20Atr >= -1.5 && distSma20Atr < 0
+          && rsVsSpy >= -8 && rsVsSpy <= -0.5
+          && distFrom52wHi >= -35 && distFrom52wHi <= -5) {
+        slowBleedShort.push(ticker);
+        continue;
+      }
+
+      // Filter B — CLEAN_LONG_STRUCTURAL
+      if (d1.d1_long_valid && rsVsSpy >= 0.5
+          && d1.daysAboveSMA20 >= 5 && d1.daysAboveSMA20 <= 12) {
+        cleanLong.push(ticker);
+      }
+    }
+    return {
+      tickers: [...new Set([...slowBleedShort, ...cleanLong])],
+      bySource: { slowBleedShort, cleanLong },
+    };
+  }
+
   async function fetchEarningsCalendar() {
     try {
       const etDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
@@ -1344,25 +1623,50 @@ window.RDT = (function () {
   async function run(extras) {
     const etCtx = getETContext();
     console.log('[RDT ' + VERSION + '] Auto-scanning at', etCtx.etStr, etCtx.phase);
+    console.log('[RDT ' + VERSION + '] constituents.js: ' + CONSTITUENTS_VERSION + ' (' + STATIC_UNIVERSE.length + ' tickers)');
     let spyChangePct = 0;
     try {
       const spyQ = await fetchJSON('https://query1.finance.yahoo.com/v7/finance/quote?symbols=SPY&fields=regularMarketChangePercent');
       spyChangePct = spyQ?.quoteResponse?.result?.[0]?.regularMarketChangePercent || 0;
     } catch(e) {}
-    // v7.3.0 — fetch screener candidates and today's earnings reporters in parallel.
-    // The earnings call is best-effort; if it fails, the watchlist is the safety net.
-    const [candidates, earningsToday] = await Promise.all([
+
+    // v8.2.0 — Parallel-launch three workstreams:
+    //   1. Catalyst hunt (Yahoo screeners — gainers/losers/most_actives)
+    //   2. Earnings calendar (today's reporters)
+    //   3. Universe pass (D1 fetch + structural pre-screen over STATIC_UNIVERSE)
+    //
+    // Universe pass is the slowest (~60–90s on a cold cache, ~2–5s on a warm
+    // cache). Catalyst hunt + earnings are fast (~5s). Doing them in parallel
+    // keeps the wall-clock cost dominated by whichever is slower; on a warm
+    // cache the whole thing is bounded by the catalyst calls.
+    const [candidates, earningsToday, universeD1] = await Promise.all([
       getCandidates(spyChangePct),
       fetchEarningsCalendar(),
+      STATIC_UNIVERSE.length > 0 ? fetchD1Universe(STATIC_UNIVERSE) : Promise.resolve({}),
     ]);
+
+    // v8.2.0 — apply structural pre-screen on the universe D1 map
+    const universePrescreen = STATIC_UNIVERSE.length > 0
+      ? prescreenUniverse(universeD1, spyChangePct)
+      : { tickers: [], bySource: { slowBleedShort: [], cleanLong: [] } };
+    if (universePrescreen.tickers.length) {
+      console.log('[RDT ' + VERSION + '] Universe pre-screen: ' +
+                  universePrescreen.bySource.slowBleedShort.length + ' SLOW_BLEED_SHORT, ' +
+                  universePrescreen.bySource.cleanLong.length + ' CLEAN_LONG_STRUCTURAL');
+      if (universePrescreen.bySource.slowBleedShort.length) {
+        console.log('[RDT ' + VERSION + '] SLOW_BLEED_SHORT candidates:', universePrescreen.bySource.slowBleedShort.join(', '));
+      }
+    }
+
     const symbols = candidates.map(c => c.symbol);
     const combined = [...new Set([
       ...symbols,
       ...MAG7,
       ...SEMI_WATCHLIST,
       ...USER_WATCHLIST,
-      ...EARNINGS_REACTOR_WATCHLIST,   // v7.3.0 — always-fetch high-frequency earnings gappers
-      ...earningsToday,                // v7.3.0 — today's pre-mkt + AMC reporters from Yahoo's earnings calendar
+      ...EARNINGS_REACTOR_WATCHLIST,    // v7.3.0 — always-fetch high-frequency earnings gappers
+      ...earningsToday,                 // v7.3.0 — today's pre-mkt + AMC reporters
+      ...universePrescreen.tickers,     // v8.2.0 — universe-derived structural candidates
       ...(extras || []),
     ])];
     console.log('[RDT ' + VERSION + '] Tickers (' + combined.length + '):', combined.join(', '));
@@ -1371,11 +1675,15 @@ window.RDT = (function () {
     } else {
       console.log('[RDT ' + VERSION + '] Earnings calendar fetch returned 0 — relying on EARNINGS_REACTOR_WATCHLIST safety net.');
     }
-    return analyze(combined, candidates, spyChangePct);
+
+    // v8.2.0 — pass the universe D1 cache to analyze() so it can skip re-fetching
+    // D1 for the universe-derived tickers.
+    return analyze(combined, candidates, spyChangePct, universeD1);
   }
 
-  async function analyze(tickers, candidates, spyChangePctIn) {
+  async function analyze(tickers, candidates, spyChangePctIn, d1Cache) {
     const etCtx = getETContext();
+    d1Cache = d1Cache || {};
 
     // v7.1.0 — fetch SPY D1 first to get the canonical change-percent.
     // The /v7/finance/quote endpoint sometimes returns 0 (caching/timing flakes);
@@ -1390,8 +1698,14 @@ window.RDT = (function () {
     const [sectorBias, vix, ...tickerData] = await Promise.all([
       fetchSectorBias(spyChangePct),
       fetchVIX(),
+      // v8.2.0 — D1 cache hit reuses universe-pass data; cache miss falls back
+      // to a fresh fetchD1 call. M5 is always fresh (intraday).
       ...tickers.map(async t => {
-        const [d1, m5] = await Promise.all([fetchD1(t), fetchM5(t)]);
+        const cachedD1 = d1Cache[t];
+        const [d1, m5] = await Promise.all([
+          cachedD1 && !cachedD1.error ? Promise.resolve(cachedD1) : fetchD1(t),
+          fetchM5(t),
+        ]);
         const cand = (candidates || []).find(c => c.symbol === t);
         const earningsDate = earningsMap[t] || cand?.earningsDate || null;
         const earningsInfo = checkEarnings(earningsDate, d1.maxRecentGap);
@@ -1481,13 +1795,14 @@ window.RDT = (function () {
       lines.push('| ' + t.ticker + ' | $' + t.d1.price + ' | ' + ch + ' | ' + rs + ' | ' + d1L + ' | ' + v + ' | ' + t.d1.haTrend + ' | ' + earn + ' | ' + gapTxt + ' |');
     });
 
-    // v7.1.0 — bucket-aware ranking
+    // v7.1.0 — bucket-aware ranking (v8.2.0 — adds SLOW_BLEED_SHORT)
     const scored = s.tickers.filter(t => t.score && t.score.direction !== 'NEUTRAL');
-    const cleanSwings = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
-    const cleanDays   = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
-    const earningsR   = scored.filter(t => t.score.bucket === 'EARNINGS_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
-    const counterT    = scored.filter(t => t.score.bucket === 'COUNTER_TREND').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
-    const waits       = scored.filter(t => t.score.bucket === 'WAIT').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const cleanSwings    = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const cleanDays      = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const slowBleed      = scored.filter(t => t.score.bucket === 'SLOW_BLEED_SHORT').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
+    const earningsR      = scored.filter(t => t.score.bucket === 'EARNINGS_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const counterT       = scored.filter(t => t.score.bucket === 'COUNTER_TREND').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    const waits          = scored.filter(t => t.score.bucket === 'WAIT').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
 
     function renderSetup(t, i) {
       const sc = t.score, d1 = t.d1, m5 = t.m5;
@@ -1584,6 +1899,14 @@ window.RDT = (function () {
     if (cleanDays.length === 0) lines.push('  (none)');
     else cleanDays.slice(0, 4).forEach(renderSetup);
 
+    if (slowBleed.length > 0) {
+      lines.push('');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      lines.push('▶ SLOW BLEED SHORTS (v8.2.0 — second-leg breakdowns from universe pass)');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      slowBleed.slice(0, 5).forEach(renderSetup);
+    }
+
     lines.push('');
     lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     lines.push('▶ EARNINGS REACTORS (post-earnings or just-reported — half size, day trade only)');
@@ -1618,6 +1941,8 @@ window.RDT = (function () {
     computeAvgVolume, classifyVolRatio, sessionElapsedFraction,
     // v7.3.0 — earnings coverage exports (so callers can inspect / override)
     fetchEarningsCalendar, EARNINGS_REACTOR_WATCHLIST, MAG7, SEMI_WATCHLIST,
+    // v8.2.0 — universe exports (so callers can re-run / inspect / override)
+    fetchD1Universe, prescreenUniverse, STATIC_UNIVERSE, CONSTITUENTS_VERSION,
   };
 })();
 
