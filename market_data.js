@@ -180,7 +180,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.6.0';
+  const VERSION = 'v8.7.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1433,6 +1433,12 @@ window.RDT = (function () {
       if (direction === 'SHORT') return distAtr < 0 && distAtr >= -_MA_BAND_ATR;
       return distAtr > 0 && distAtr <= _MA_BAND_ATR;
     };
+    // v8.6.0 — SMA timeframe weighting. NOT all SMAs are equal: the longer the
+    // average, the more institutional memory it carries, so it should drive a
+    // bigger edge swing. SMA20 lightest → SMA200 heaviest. Weights are centred
+    // near 1.0 so they scale the ±1.0/±1.5 MA adjustment sensibly.
+    const maWeightOf = (ma) => !ma ? 1.0 : /200/.test(ma) ? 1.4 : /100/.test(ma) ? 1.1 : /50/.test(ma) ? 0.85 : 0.6;
+    let maGovWeight = 1.0; // weight of the SMA/cluster governing this setup's MA state
     let maState = 'CLEAR', maConditional = false, maNote = 'No daily MA hazard in the trade path — clean. Actionable.';
     if (_maList.length && _atrLocal > 0 && (direction === 'LONG' || direction === 'SHORT')) {
       const nearestMA = maProximity[0];
@@ -1441,12 +1447,14 @@ window.RDT = (function () {
       const verb = direction === 'SHORT' ? 'Shorting into' : 'Buying into';
       if (maCluster && _maHazard(clusterSigned)) {
         maState = 'AT_CLUSTER'; maConditional = true;
+        maGovWeight = Math.max.apply(null, maCluster.members.map(maWeightOf)); // cluster as strong as its heaviest MA
         maNote = verb + ' a daily MA cluster (' + maCluster.members.join('+') + ' ≈ $' + maCluster.center
           + ', ' + Math.abs(clusterSigned) + '×ATR ' + (clusterSigned >= 0 ? 'above' : 'below')
           + ') — first touch usually bounces. CONDITIONAL: wait for a confirmed 5-min close '
           + dir + ' $' + maCluster.center + ' on ≥1.5× vol (breakthrough), or a bounce-and-reject off it.';
       } else if (nearestMA && _maHazard(nearestMA.distAtr)) {
         maState = 'AT_MA'; maConditional = true;
+        maGovWeight = maWeightOf(nearestMA.ma);
         maNote = verb + ' the daily ' + nearestMA.ma + ' $' + nearestMA.level + ' (' + Math.abs(nearestMA.distAtr)
           + '×ATR ' + (nearestMA.distAtr >= 0 ? 'above' : 'below')
           + ') — first-touch bounce risk. CONDITIONAL: need a confirmed close ' + dir + ' it on ≥1.5× vol, or a bounce-and-reject.';
@@ -1462,20 +1470,33 @@ window.RDT = (function () {
     // intraday M5 is the fallback for a same-session break/bounce.
     let maConfirmed = false, maConfirmVia = null;
     if (_maList.length && _atrLocal > 0 && (direction === 'LONG' || direction === 'SHORT')) {
-      const wantBreak  = direction === 'SHORT' ? 'BREAK_DOWN'  : 'BREAK_UP';
-      const wantBounce = direction === 'SHORT' ? 'BOUNCE_DOWN' : 'BOUNCE_UP';
-      const daily = (d1.smaEvents || [])
-        .filter(e => e.confirmed && (e.type === wantBreak || e.type === wantBounce))
-        .sort((a, b) => a.daysAgo - b.daysAgo)[0];
+      const events = d1.smaEvents || [];
+      const BULL = new Set(['BREAK_UP', 'BOUNCE_UP']);
+      const BEAR = new Set(['BREAK_DOWN', 'BOUNCE_DOWN']);
+      const wantSide = direction === 'SHORT' ? BEAR : BULL;
+      const oppSide  = direction === 'SHORT' ? BULL : BEAR;
+      // RECENCY: a bounce/rejection decays fast (≤1 session); a break has a bit
+      // more durability (≤2). NEGATION: discard any event that price later crossed
+      // back through (a more-recent opposite-side event on the same MA invalidates
+      // it). Together these kill stale/negated signals like DASH's 3-day-old
+      // rejection that the next day's rally back above the SMA had already undone.
+      const recencyOk = (e) => e.type.indexOf('BREAK') === 0 ? e.daysAgo <= 2 : e.daysAgo <= 1;
+      const negated   = (e) => events.some(o => o.ma === e.ma && o.daysAgo < e.daysAgo && oppSide.has(o.type));
+      const daily = events
+        .filter(e => e.confirmed && wantSide.has(e.type) && recencyOk(e) && !negated(e))
+        // prefer the heavier SMA (a 200 break/bounce outranks a 20), then recency
+        .sort((a, b) => (maWeightOf(b.ma) - maWeightOf(a.ma)) || (a.daysAgo - b.daysAgo))[0];
       if (daily) {
-        maConfirmed = true; maConfirmVia = 'daily';
-        maState = (daily.type === wantBreak) ? 'CONFIRMED_BREAK' : 'CONFIRMED_BOUNCE';
+        maConfirmed = true; maConfirmVia = 'daily'; maGovWeight = maWeightOf(daily.ma);
+        const isBreak = daily.type.indexOf('BREAK') === 0;
+        // direction-accurate state: LONG off support = BOUNCE; SHORT at resistance = REJECT.
+        maState = isBreak ? 'CONFIRMED_BREAK' : (direction === 'SHORT' ? 'CONFIRMED_REJECT' : 'CONFIRMED_BOUNCE');
         const ago = daily.daysAgo === 0 ? 'today' : daily.daysAgo + 'd ago';
-        maNote = (maState === 'CONFIRMED_BREAK')
+        maNote = isBreak
           ? 'CONFIRMED daily break ' + (direction === 'SHORT' ? 'BELOW' : 'ABOVE') + ' ' + daily.ma + ' $' + daily.level
             + ' ' + ago + ' on ' + (daily.volRatio != null ? daily.volRatio + '×' : '?') + ' vol — actionable.'
           : 'CONFIRMED daily ' + (direction === 'SHORT' ? 'rejection at' : 'bounce off') + ' ' + daily.ma + ' $' + daily.level
-            + ' ' + ago + ' — actionable.';
+            + ' ' + ago + ' (not negated since) — actionable.';
       }
       if (!maConfirmed && Array.isArray(m5 && m5.recentCandles) && m5.recentCandles.length >= 3) {
         const useCluster = maCluster && Math.abs((maCluster.center - d1.price) / _atrLocal) <= _MA_BAND_ATR;
@@ -1493,7 +1514,7 @@ window.RDT = (function () {
                 maConfirmed = true; maConfirmVia = 'M5'; maState = 'CONFIRMED_BREAK';
                 maNote = 'CONFIRMED intraday M5 break BELOW ' + refMa + ' $' + parseFloat(ref.toFixed(2)) + ' on heavy pace (' + paceRVol + '×) — actionable.';
               } else if (rc.some(c => c.h != null && c.h >= ref && c.c < ref) && last.c < ref) {
-                maConfirmed = true; maConfirmVia = 'M5'; maState = 'CONFIRMED_BOUNCE';
+                maConfirmed = true; maConfirmVia = 'M5'; maState = 'CONFIRMED_REJECT';
                 maNote = 'CONFIRMED intraday M5 rejection at ' + refMa + ' $' + parseFloat(ref.toFixed(2)) + ' (tagged & closed back below) — actionable short.';
               }
             } else {
@@ -1507,6 +1528,9 @@ window.RDT = (function () {
               }
             }
           }
+          if (maConfirmVia === 'M5') maGovWeight = useCluster
+            ? Math.max.apply(null, maCluster.members.map(maWeightOf))
+            : maWeightOf(maProximity[0] && maProximity[0].ma);
         }
       }
       if (maConfirmed) maConditional = false;
@@ -1738,9 +1762,13 @@ window.RDT = (function () {
       // v8.5.0/8.6.0 — MA adjustment. Driving into a daily MA wall docks the score
       // (first-touch bounce risk); a CONFIRMED break-through / bounce-off boosts it
       // (the ambiguity is resolved in the trade's favour and is a setup in itself).
-      const maAdj = maConfirmed ? 1.0
-                  : maConditional ? (maState === 'AT_CLUSTER' ? -1.5 : -1.0)
-                  : 0;
+      // v8.6.0 — base MA adjustment, SCALED by the governing SMA's timeframe weight
+      // (SMA20 ×0.6 … SMA200 ×1.4). A confirmed break of the 200 swings the edge
+      // far more than a 20; a hazard at the 200 is a far stronger bounce risk.
+      const maAdjBase = maConfirmed ? 1.0
+                      : maConditional ? (maState === 'AT_CLUSTER' ? -1.5 : -1.0)
+                      : 0;
+      const maAdj = parseFloat((maAdjBase * (maGovWeight || 1.0)).toFixed(2));
       const score = parseFloat((pEntry + pTrend + pRS + pRR + pConf + maAdj).toFixed(2));
       // gap-chase guardrail: a 1–2 day trend on a huge (≥5%) single-day RS spike
       // cannot be HIGH — almost always an unconfirmed earnings/news gap.
@@ -1751,7 +1779,7 @@ window.RDT = (function () {
       if (maConditional && label === 'HIGH') label = 'MEDIUM';
       return {
         score, label,
-        factors: { pEntry, pTrend, pRS, pRR, pConf, maAdj,
+        factors: { pEntry, pTrend, pRS, pRR, pConf, maAdj, maGovWeight,
                    extAtr: ext == null ? null : parseFloat(ext.toFixed(2)),
                    trendDays: td, bestRR: parseFloat(bestRR.toFixed(2)) }
       };
@@ -1776,14 +1804,16 @@ window.RDT = (function () {
       conviction += ' 🔴 POST-GAP';
     }
     // v8.5.0/8.6.0 — MA tags: confirmed break/bounce (actionable) or conditional.
-    if (maConfirmed) conviction += (maState === 'CONFIRMED_BREAK' ? ' 🧭 BREAK ✅' : ' 🧭 BOUNCE ✅');
+    if (maConfirmed) conviction += (maState === 'CONFIRMED_BREAK' ? ' 🧭 BREAK ✅'
+                                  : maState === 'CONFIRMED_REJECT' ? ' 🧭 REJECT ✅'
+                                  : ' 🧭 BOUNCE ✅');
     else if (maConditional) conviction += ' 🧭 MA-COND';
 
     return {
       direction, setupType, rsScore, hasRS, hasRW,
       confluences, conviction, edgeScore, convictionFactors, counterTrend, counterTrendStrength,
       // v8.5.0 — daily SMA proximity + MA-cluster gate; v8.6.0 — confirmation
-      maProximity, maCluster, maState, maConditional, maNote, maConfirmed, maConfirmVia,
+      maProximity, maCluster, maState, maConditional, maNote, maConfirmed, maConfirmVia, maGovWeight,
       rrEntry, rrStop, rrStopNote, rrT1, rrT1Source, rrT2, rrRatio, poorRR,
       compositeScore, swingEligible, swingCandidate, swingNote,
       bucket, entryNote, stopNote,
