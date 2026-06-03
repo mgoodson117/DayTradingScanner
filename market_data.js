@@ -180,7 +180,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.3.0';
+  const VERSION = 'v8.4.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1385,14 +1385,35 @@ window.RDT = (function () {
                                  && _distFrom52wHi != null && _distFrom52wHi <= -10;
     const meltupShortRaisedBar = _isMeltupShort && !_meltupShortRaisedBarOk;
 
+    // v8.4.0 Tier-1 fix #2 — "best achievable" R:R uses the FURTHER target (T2),
+    // not the conservative 1/3-off T1. Gating on T1 alone discards tiered-exit
+    // runners: validation on logged trades that carry T2 data showed a T2-aware
+    // gate keeps 29/31 long picks and drops only 2 net-losers, whereas a blunt
+    // T1 gate threw out winning runners. Route to WATCHLIST_LOWRR only when even
+    // the T2 target cannot produce 1.5:1.
+    const _rrRisk = (rrStop != null) ? Math.abs(rrEntry - rrStop) : null;
+    const _rrT2Ratio = (_rrRisk && _rrRisk > 0 && rrT2 != null)
+      ? Math.abs(rrT2 - rrEntry) / _rrRisk : null;
+    const _bestAchievableRR = Math.max(rrRatio || 0, _rrT2Ratio || 0);
+
     let bucket;
     if (direction === 'NEUTRAL')                                                                       bucket = 'NEUTRAL';
     else if (counterTrend)                                                                              bucket = 'COUNTER_TREND';
     else if (_isReactor && !earnReactorQualified)                                                       bucket = 'WATCHLIST_REACTOR';
     else if (_isReactor)                                                                                bucket = 'EARNINGS_REACTOR';
     else if (setupType === 'WAIT_VWAP_RECLAIM')                                                         bucket = 'WAIT';
+    // v8.4.0 Tier-1 fix #3 — suppress ALL shorts in a confirmed melt-up regime
+    // (watchlist-only). Backtest of 121 logged picks (May12–Jun2): shorts booked
+    // -8.0R at a 37% triggered win rate in an up-tape. Route slow-bleed, clean,
+    // and raised-bar shorts to watch instead of publishing them as trades.
+    else if (direction === 'SHORT' && spyContext.meltupRegime === true)                                 bucket = 'WATCHLIST_MELTUP_SHORT';
     else if (slowBleedShort)                                                                            bucket = 'SLOW_BLEED_SHORT';
     else if (meltupShortRaisedBar)                                                                      bucket = 'WATCHLIST_MELTUP_SHORT';
+    // v8.4.0 Tier-1 fix #2 — enforce the R:R floor at the SCANNER, not just as a
+    // rendered label. A would-be clean setup with no computable R:R, or R:R < 1.5:1
+    // to T1, is routed to WATCHLIST_LOWRR and never occupies a publishable Top slot.
+    // (Historically 59% of triggered trades ran < 1.5:1 because this rule was prose-only.)
+    else if (_bestAchievableRR < 1.5)                                                                   bucket = 'WATCHLIST_LOWRR';
     else                                                                                                bucket = swingCandidate ? 'CLEAN_SWING' : 'CLEAN_DAY';
 
     let entryNote = 'No clear setup';
@@ -1903,12 +1924,20 @@ window.RDT = (function () {
     // v8.3.0 — adds WATCHLIST_REACTOR (unqualified earnings reactors) and
     //          WATCHLIST_MELTUP_SHORT (weak shorts in melt-up regime)
     const scored = s.tickers.filter(t => t.score && t.score.direction !== 'NEUTRAL');
-    const cleanSwings    = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
-    const cleanDays      = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
+    // v8.4.0 Tier-1 fix #1 — rank the two headline buckets on compositeScoreV8
+    // (which stacks extensionPenalty × hodProximityPenalty × stopQualityFactor ×
+    // trendAgeMultiplier) instead of the legacy compositeScore. Previously all of
+    // the anti-chase penalty work was computed but never used to order the only
+    // buckets that get published — so the scanner ranked the most-extended names
+    // at the top, which is why HIGH-conviction picks underperformed MEDIUM.
+    const cleanSwings    = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
+    const cleanDays      = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
     const slowBleed      = scored.filter(t => t.score.bucket === 'SLOW_BLEED_SHORT').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
     const earningsR      = scored.filter(t => t.score.bucket === 'EARNINGS_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
     const watchReactor   = scored.filter(t => t.score.bucket === 'WATCHLIST_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
     const watchMeltup    = scored.filter(t => t.score.bucket === 'WATCHLIST_MELTUP_SHORT').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
+    // v8.4.0 Tier-1 fix #2 — low-R:R setups routed out of the publishable buckets
+    const watchLowRR     = scored.filter(t => t.score.bucket === 'WATCHLIST_LOWRR').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
     const counterT       = scored.filter(t => t.score.bucket === 'COUNTER_TREND').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
     const waits          = scored.filter(t => t.score.bucket === 'WAIT').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
 
@@ -2053,6 +2082,15 @@ window.RDT = (function () {
       lines.push('  Failed ≥1 of: cleanCount≥4 | 6+ days below SMA20 | ≥10% off 52w high');
       lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
       watchMeltup.slice(0, 5).forEach(renderSetup);
+    }
+    if (watchLowRR.length > 0) {
+      lines.push('');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      lines.push('▶ WATCHLIST — BELOW R:R FLOOR (v8.4.0 — R:R < 1.5:1 or no target)');
+      lines.push('  Not publishable as Top setups. Need a better entry (closer to support)');
+      lines.push('  or a higher target before the risk/reward clears 1.5:1.');
+      lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      watchLowRR.slice(0, 5).forEach(renderSetup);
     }
 
     return lines.join('\n');
