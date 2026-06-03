@@ -1078,6 +1078,13 @@ window.RDT = (function () {
 
   function scoreStock(d1, m5, spyChangePct, earningsInfo, etCtx, spyContext) {
     spyContext = spyContext || {};
+    // v8.4.0 Tier-2 — intraday regime-flip detector. In a confirmed melt-up, SPY
+    // holding its VWAP on a mild-red day is a HEALTHY PULLBACK (longs stay live,
+    // shorts parked); SPY losing its VWAP is an INTRADAY BREAKDOWN (longs become
+    // counter-trend, melt-up short suppression released). Unknown VWAP
+    // (pre-open/weekend) is treated as intact.
+    const _meltup = spyContext.meltupRegime === true;
+    const _spyIntradayHealthy = spyContext.spyAboveVwap !== false; // true or null => intact
     const rsScore = parseFloat((d1.changePct - spyChangePct).toFixed(2));
     const hasRS = rsScore > 0.5, hasRW = rsScore < -0.5;
     const nearAlgoLines = (d1.algoLines || []).filter(l => l.nearCurrent);
@@ -1162,25 +1169,20 @@ window.RDT = (function () {
     }
 
     const cleanCount = confluences.filter(c => c.includes('✅')).length;
-    let conviction = cleanCount >= 5 ? 'HIGH' : cleanCount >= 3 ? 'MEDIUM' : 'LOW';
-    // v7.1.0 — also downgrade for justReported (daysUntil ∈ [-3, 0]).
-    if (earningsInfo.hasUpcoming) {
-      if (conviction === 'HIGH')   conviction = 'MEDIUM';
-      if (conviction === 'MEDIUM') conviction = 'LOW';
-      conviction += ' ⚠️ EARNINGS';
-    }
-    if (earningsInfo.justReported) {
-      if (conviction === 'HIGH')   conviction = 'MEDIUM';
-      if (conviction === 'MEDIUM') conviction = 'LOW';
-      conviction += ' 📊 JUST-REPORTED';
-    }
-    if (earningsInfo.likelyPostEarnings) {
-      if (conviction === 'HIGH') conviction = 'MEDIUM';
-      conviction += ' 🔴 POST-GAP';
-    }
+    // v8.4.0 Tier-2 — conviction is NO LONGER derived from cleanCount here.
+    // The cleanCount tier model (>=5 HIGH / >=3 MEDIUM) selected the most-extended
+    // names — more confluences correlated with chase-the-high entries, not edge —
+    // so HIGH historically underperformed MEDIUM (+0.06R vs +0.20R). Conviction is
+    // now computed near the end of scoreStock() from an edge-based edgeScore (see
+    // the `_edgeConviction` block) once trend-age and best-achievable R:R are known.
 
     // v7.1.0 — counter-trend penalty applies even at small SPY moves when individual RS is huge
-    const counterTrend = (direction === 'SHORT' && spyChangePct > 0) || (direction === 'LONG' && spyChangePct < 0);
+    // v8.4.0 Tier-2 Choice 1 — a mild red day inside an intact melt-up (SPY still
+    // holding VWAP) is a healthy PULLBACK, not a counter-trend long. Longs are only
+    // counter-trend when SPY is red AND not in a healthy-pullback melt-up.
+    const counterTrend =
+        (direction === 'SHORT' && spyChangePct > 0)
+     || (direction === 'LONG'  && spyChangePct < 0 && !(_meltup && _spyIntradayHealthy));
     const hugeIndividualMove = Math.abs(rsScore) >= 5;
     const counterTrendStrength = counterTrend
       ? (Math.abs(spyChangePct) >= 0.5 ? 'STRONG'
@@ -1379,7 +1381,10 @@ window.RDT = (function () {
     // for today (caller-set context is more accurate; this is a conservative
     // backstop). The full regime test (above all 4 SMAs + up ≥3 of last 5) is
     // applied in run() and threaded back via window._scan.spyMeltupRegime.
-    const _isMeltupShort = direction === 'SHORT' && spyContext.meltupRegime === true;
+    // v8.4.0 Tier-2 Choice 2 — release the melt-up short suppression once SPY loses
+    // its VWAP (intraday breakdown). While SPY holds VWAP the uptrend is intact and
+    // shorts stay parked; on a breakdown they route to their normal short buckets.
+    const _isMeltupShort = direction === 'SHORT' && _meltup && _spyIntradayHealthy;
     const _meltupShortRaisedBarOk = direction === 'SHORT' && cleanCount >= 4
                                  && (d1.daysBelowSMA20 || 0) >= 6
                                  && _distFrom52wHi != null && _distFrom52wHi <= -10;
@@ -1406,7 +1411,7 @@ window.RDT = (function () {
     // (watchlist-only). Backtest of 121 logged picks (May12–Jun2): shorts booked
     // -8.0R at a 37% triggered win rate in an up-tape. Route slow-bleed, clean,
     // and raised-bar shorts to watch instead of publishing them as trades.
-    else if (direction === 'SHORT' && spyContext.meltupRegime === true)                                 bucket = 'WATCHLIST_MELTUP_SHORT';
+    else if (_isMeltupShort)                                                                            bucket = 'WATCHLIST_MELTUP_SHORT';
     else if (slowBleedShort)                                                                            bucket = 'SLOW_BLEED_SHORT';
     else if (meltupShortRaisedBar)                                                                      bucket = 'WATCHLIST_MELTUP_SHORT';
     // v8.4.0 Tier-1 fix #2 — enforce the R:R floor at the SCANNER, not just as a
@@ -1501,9 +1506,87 @@ window.RDT = (function () {
        * extensionPenalty * hodProximityPenalty * stopQualityFactor * trendAgeMultiplier).toFixed(2)
     );
 
+    // v8.4.0 Tier-2 — EDGE-BASED CONVICTION (replaces the cleanCount tier model).
+    // Built from INDEPENDENT, edge-bearing factors, with redundant confluences
+    // capped and extension / stale-trend explicitly penalised. On the May–Jun book
+    // the old model put HIGH on the most-extended names (e.g. WDC at trend-age 30,
+    // ODFL 3.3×ATR above SMA20) while clean pullback entries sat at MEDIUM/LOW.
+    // Factor weights (max ≈ 11): entry-quality 2.5 · trend-age 2 · RS strength 2.5 ·
+    // R:R 2 · capped independent confirmations 2.
+    function _edgeConviction() {
+      if (direction !== 'LONG' && direction !== 'SHORT')
+        return { score: 0, label: 'LOW', factors: null };
+      // extension in ATR units, signed so "extended in the trade direction" is +ve
+      const ext = _distSma20Atr == null ? null
+                : (direction === 'LONG' ? _distSma20Atr : -_distSma20Atr);
+      let pEntry = 0;
+      if (ext == null) pEntry = 0;
+      else if (ext <= 1.0)  pEntry = 2.5;   // at/near the 20SMA — best entry, low chase risk
+      else if (ext <= 1.75) pEntry = 1.5;
+      else if (ext <= 2.5)  pEntry = 0.5;
+      else if (ext <= 3.0)  pEntry = 0;
+      else                  pEntry = -1.0;  // chasing an extended move
+      const td = _trendDays || 0;
+      let pTrend = 0;
+      if (td >= 6 && td <= 10)       pTrend = 2;    // second-leg sweet spot (~52% win)
+      else if (td >= 11 && td <= 15) pTrend = 1;
+      else if (td >= 1 && td <= 5)   pTrend = 0.5;
+      else if (td >= 16)             pTrend = -1;   // burned-out trend (~28% win)
+      let rsAbs = Math.abs(rsScore || 0);
+      if (td && td <= 2) rsAbs = Math.min(rsAbs, 1.5); // a 1–2 day move is a gap, not accumulation
+      let pRS = 0;
+      if (rsAbs >= 4)        pRS = 2.5;
+      else if (rsAbs >= 2.5) pRS = 2;
+      else if (rsAbs >= 1.5) pRS = 1.5;
+      else if (rsAbs >= 0.75)pRS = 1;
+      else if (rsAbs >= 0.5) pRS = 0.5;
+      const bestRR = _bestAchievableRR || 0;
+      let pRR = 0;
+      if (bestRR >= 3)        pRR = 2;
+      else if (bestRR >= 2)   pRR = 1.5;
+      else if (bestRR >= 1.5) pRR = 1;
+      // independent confirmations, capped at 2 — kills the redundant-checkbox inflation
+      let cats = 0;
+      if (confluences.some(c => (c.includes('Pace RVol') && c.includes('✅')) || c.includes('Pre-mkt'))) cats++;
+      if (confluences.some(c => c.includes('BROKE'))) cats++;
+      if (confluences.some(c => c.includes('HA ') && c.includes('✅'))) cats++;
+      const pConf = Math.min(cats, 2);
+      const score = parseFloat((pEntry + pTrend + pRS + pRR + pConf).toFixed(2));
+      // gap-chase guardrail: a 1–2 day trend on a huge (≥5%) single-day RS spike
+      // cannot be HIGH — almost always an unconfirmed earnings/news gap.
+      const gapChase = !!td && td <= 2 && Math.abs(rsScore || 0) >= 5;
+      let label = score >= 7 ? 'HIGH' : score >= 4.5 ? 'MEDIUM' : 'LOW';
+      if (gapChase && label === 'HIGH') label = 'MEDIUM';
+      return {
+        score, label,
+        factors: { pEntry, pTrend, pRS, pRR, pConf,
+                   extAtr: ext == null ? null : parseFloat(ext.toFixed(2)),
+                   trendDays: td, bestRR: parseFloat(bestRR.toFixed(2)) }
+      };
+    }
+    const _ec = _edgeConviction();
+    const edgeScore = _ec.score;
+    const convictionFactors = _ec.factors;
+    let conviction = _ec.label;
+    // Preserve the existing earnings / just-reported / post-gap downgrades + tags.
+    if (earningsInfo.hasUpcoming) {
+      if (conviction === 'HIGH')        conviction = 'MEDIUM';
+      else if (conviction === 'MEDIUM') conviction = 'LOW';
+      conviction += ' ⚠️ EARNINGS';
+    }
+    if (earningsInfo.justReported) {
+      if (conviction === 'HIGH')        conviction = 'MEDIUM';
+      else if (conviction === 'MEDIUM') conviction = 'LOW';
+      conviction += ' 📊 JUST-REPORTED';
+    }
+    if (earningsInfo.likelyPostEarnings) {
+      if (conviction === 'HIGH') conviction = 'MEDIUM';
+      conviction += ' 🔴 POST-GAP';
+    }
+
     return {
       direction, setupType, rsScore, hasRS, hasRW,
-      confluences, conviction, counterTrend, counterTrendStrength,
+      confluences, conviction, edgeScore, convictionFactors, counterTrend, counterTrendStrength,
       rrEntry, rrStop, rrStopNote, rrT1, rrT1Source, rrT2, rrRatio, poorRR,
       compositeScore, swingEligible, swingCandidate, swingNote,
       bucket, entryNote, stopNote,
@@ -1813,7 +1896,17 @@ window.RDT = (function () {
                             && spyD1.d1_long_valid
                             && (spyD1.upDaysLast5 || 0) >= 3);
     console.log('[RDT ' + VERSION + '] SPY regime: ' + (spyMeltupRegime ? 'MELT-UP (above all SMAs + up ≥3 of last 5)' : 'not melt-up'));
-    const spyContext = { meltupRegime: spyMeltupRegime, upDaysLast5: spyD1?.upDaysLast5 ?? null };
+    // v8.4.0 Tier-2 — SPY intraday VWAP state drives the regime "flip" detector.
+    // Above VWAP (or unknown pre-open) = uptrend intact; below VWAP = intraday breakdown.
+    const spyAboveVwap = (spyM5 && typeof spyM5.aboveVwap === 'boolean') ? spyM5.aboveVwap : null;
+    console.log('[RDT ' + VERSION + '] SPY intraday: ' +
+      (spyAboveVwap === null ? 'VWAP n/a (pre-open/weekend) — treated as intact'
+       : spyAboveVwap ? 'above VWAP — uptrend intact' : 'below VWAP — INTRADAY BREAKDOWN'));
+    const spyContext = {
+      meltupRegime: spyMeltupRegime,
+      upDaysLast5: spyD1?.upDaysLast5 ?? null,
+      spyAboveVwap,
+    };
 
     const earningsMap = await fetchEarningsDates(tickers);
 
@@ -1924,14 +2017,15 @@ window.RDT = (function () {
     // v8.3.0 — adds WATCHLIST_REACTOR (unqualified earnings reactors) and
     //          WATCHLIST_MELTUP_SHORT (weak shorts in melt-up regime)
     const scored = s.tickers.filter(t => t.score && t.score.direction !== 'NEUTRAL');
-    // v8.4.0 Tier-1 fix #1 — rank the two headline buckets on compositeScoreV8
-    // (which stacks extensionPenalty × hodProximityPenalty × stopQualityFactor ×
-    // trendAgeMultiplier) instead of the legacy compositeScore. Previously all of
-    // the anti-chase penalty work was computed but never used to order the only
-    // buckets that get published — so the scanner ranked the most-extended names
-    // at the top, which is why HIGH-conviction picks underperformed MEDIUM.
-    const cleanSwings    = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
-    const cleanDays      = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
+    // v8.4.0 Tier-2 — rank the two headline buckets on EDGESCORE (entry quality +
+    // trend-age + RS strength + R:R + capped confirmations), with compositeScoreV8
+    // as the tie-break. edgeScore already integrates the anti-chase factors that
+    // compositeScoreV8 stacked (extension, HOD proximity, trend age, R:R) but does
+    // so additively and without the redundant-confluence inflation in the V8 base,
+    // so it orders clean pullback entries above extended/stale ones directly.
+    const _rankKey = (s) => (s.edgeScore || 0) * 1000 + (s.compositeScoreV8 || 0);
+    const cleanSwings    = scored.filter(t => t.score.bucket === 'CLEAN_SWING').sort((a,b) => _rankKey(b.score) - _rankKey(a.score));
+    const cleanDays      = scored.filter(t => t.score.bucket === 'CLEAN_DAY').sort((a,b) => _rankKey(b.score) - _rankKey(a.score));
     const slowBleed      = scored.filter(t => t.score.bucket === 'SLOW_BLEED_SHORT').sort((a,b) => b.score.compositeScoreV8 - a.score.compositeScoreV8);
     const earningsR      = scored.filter(t => t.score.bucket === 'EARNINGS_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
     const watchReactor   = scored.filter(t => t.score.bucket === 'WATCHLIST_REACTOR').sort((a,b) => b.score.compositeScore - a.score.compositeScore);
@@ -1944,7 +2038,7 @@ window.RDT = (function () {
     function renderSetup(t, i) {
       const sc = t.score, d1 = t.d1, m5 = t.m5;
       lines.push('');
-      lines.push('  #' + (i+1) + ' ' + t.ticker + ' — ' + sc.direction + ' | ' + sc.conviction + ' | Score ' + sc.compositeScore + ' | Bucket ' + sc.bucket);
+      lines.push('  #' + (i+1) + ' ' + t.ticker + ' — ' + sc.direction + ' | ' + sc.conviction + ' | Edge ' + sc.edgeScore + ' | ScoreV8 ' + sc.compositeScoreV8 + ' | Bucket ' + sc.bucket);
       lines.push('     Price $' + d1.price + ' (' + (d1.changePct >= 0 ? '+' : '') + d1.changePct + '%) | RS ' + sc.rsScore + '%');
       lines.push('     M5 VWAP $' + (m5?.vwap || 'n/a') + ' ' + (m5?.aboveVwap === true ? '✅' : m5?.aboveVwap === false ? '⛔' : ''));
       lines.push('     HA ' + d1.haTrend + ' | ATR(20) $' + d1.atr20);
@@ -2098,6 +2192,7 @@ window.RDT = (function () {
 
   return {
     VERSION, run, analyze, summary,
+    scoreStock,
     fetchD1, fetchM5, fetchVIX, fetchSectorBias,
     computeAlgoLinesV7, findPriorSwingLevels, computeATR, computeAnchoredVWAP,
     getETContext, getHODProximity, getM5TrendState,
