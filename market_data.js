@@ -180,7 +180,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.5.0';
+  const VERSION = 'v8.6.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -834,6 +834,48 @@ window.RDT = (function () {
         };
       }
 
+      // v8.6.0 — DAILY SMA break/bounce events (confirmation signals).
+      // Looks back up to 3 sessions for a close THROUGH an SMA (break) or a
+      // pierce-and-close-back (bounce), using the SMA value AT each bar. Breaks
+      // require ≥1.5× volume to be "confirmed"; bounces require price to be on the
+      // correct side now. These let the scorer promote a near-MA setup from
+      // "conditional" to a highlighted, actionable confirmed break/bounce.
+      const smaEvents = (() => {
+        const out = [];
+        const last = candles.length - 1;
+        if (last < 1) return out;
+        const volAvg20 = (() => {
+          const vs = candles.slice(-21, -1).map(c => c.v).filter(v => v > 0);
+          return vs.length ? vs.reduce((a, b) => a + b, 0) / vs.length : null;
+        })();
+        const smaAt = (n, i) => {
+          if (i + 1 < n) return null;
+          let s = 0; for (let k = i - n + 1; k <= i; k++) s += closes[k];
+          return s / n;
+        };
+        const defs = [['SMA20', 20, s20], ['SMA50', 50, s50], ['SMA100', 100, s100], ['SMA200', 200, s200]];
+        const LOOKBACK = 3;
+        for (const [label, n, curVal] of defs) {
+          if (!curVal) continue;
+          for (let i = last; i >= Math.max(n, last - LOOKBACK); i--) {
+            const smaI = smaAt(n, i), smaPrev = smaAt(n, i - 1);
+            if (smaI == null || smaPrev == null) continue;
+            const c = candles[i], cPrev = candles[i - 1], daysAgo = last - i;
+            const volR = volAvg20 ? parseFloat((c.v / volAvg20).toFixed(2)) : null;
+            if (cPrev.c >= smaPrev && c.c < smaI) {
+              out.push({ ma: label, level: parseFloat(curVal.toFixed(2)), type: 'BREAK_DOWN', daysAgo, volRatio: volR, confirmed: !!(volR && volR >= 1.5) && price < curVal });
+            } else if (cPrev.c <= smaPrev && c.c > smaI) {
+              out.push({ ma: label, level: parseFloat(curVal.toFixed(2)), type: 'BREAK_UP', daysAgo, volRatio: volR, confirmed: !!(volR && volR >= 1.5) && price > curVal });
+            } else if (c.l < smaI && c.c > smaI) {
+              out.push({ ma: label, level: parseFloat(curVal.toFixed(2)), type: 'BOUNCE_UP', daysAgo, volRatio: volR, confirmed: price > curVal });
+            } else if (c.h > smaI && c.c < smaI) {
+              out.push({ ma: label, level: parseFloat(curVal.toFixed(2)), type: 'BOUNCE_DOWN', daysAgo, volRatio: volR, confirmed: price < curVal });
+            }
+          }
+        }
+        return out;
+      })();
+
       return {
         ticker, price: parseFloat(price.toFixed(2)),
         changePct: prevDayClose ? parseFloat(((price - prevDayClose) / prevDayClose * 100).toFixed(2)) : 0,
@@ -862,6 +904,8 @@ window.RDT = (function () {
         daysAboveSMA20, daysBelowSMA20,
         // v8.3.0 — up-days count for melt-up regime detection
         upDaysLast5,
+        // v8.6.0 — daily SMA break/bounce confirmation events
+        smaEvents,
       };
     } catch(e) { return { ticker, error: e.message || 'fetch failed' }; }
   }
@@ -888,7 +932,7 @@ window.RDT = (function () {
       const isRegularSession = nowTs >= regularStart && nowTs < regularEnd;
       const marketState = isRegularSession ? 'REGULAR' : (nowTs < regularStart ? 'PRE' : 'POST');
 
-      const sessionCloses = [], sessionVolumes = [], sessionOpens = [];
+      const sessionCloses = [], sessionVolumes = [], sessionOpens = [], sessionHighs = [], sessionLows = [];
       let cumTPV = 0, cumVol = 0;
       // v7.2.0 — pre-market volume (today + prior days for averaging)
       let preMktVolumeToday = 0;
@@ -923,6 +967,8 @@ window.RDT = (function () {
           if (c != null) sessionCloses.push(c);
           if (v != null) sessionVolumes.push(v);
           if (o != null) sessionOpens.push(o);
+          if (h != null) sessionHighs.push(h);
+          if (l != null) sessionLows.push(l);
           if (h && l && c && v) { cumTPV += ((h + l + c) / 3) * v; cumVol += v; }
         }
 
@@ -964,8 +1010,19 @@ window.RDT = (function () {
       // v7.2.0 — sessionVolume = sum of today's regular-session candle volumes
       const sessionVolume = sessionVolumes.reduce((a, b) => a + b, 0);
 
+      // v8.6.0 — compact recent M5 candles (last 12 ≈ 1h) so the scorer can
+      // confirm an intraday break through / bounce off a DAILY SMA level.
+      const recentCandles = (() => {
+        const out = [], len = sessionCloses.length;
+        for (let i = Math.max(0, len - 12); i < len; i++) {
+          out.push({ c: sessionCloses[i], h: sessionHighs[i], l: sessionLows[i], v: sessionVolumes[i] });
+        }
+        return out;
+      })();
+
       return {
         ticker, price: price?.toFixed(2),
+        recentCandles,
         vwap: vwap?.toFixed(2) ?? null, aboveVwap,
         sma8_m5: sma8?.toFixed(2) ?? null,
         sma20_m5: sma20?.toFixed(2) ?? null,
@@ -1399,6 +1456,62 @@ window.RDT = (function () {
       }
     }
 
+    // v8.6.0 — CONFIRMATION pass. A daily-close or intraday-M5 break THROUGH /
+    // bounce OFF the relevant SMA promotes the setup to actionable and highlights
+    // it (overrides the conditional hazard above). Daily confirmation is preferred;
+    // intraday M5 is the fallback for a same-session break/bounce.
+    let maConfirmed = false, maConfirmVia = null;
+    if (_maList.length && _atrLocal > 0 && (direction === 'LONG' || direction === 'SHORT')) {
+      const wantBreak  = direction === 'SHORT' ? 'BREAK_DOWN'  : 'BREAK_UP';
+      const wantBounce = direction === 'SHORT' ? 'BOUNCE_DOWN' : 'BOUNCE_UP';
+      const daily = (d1.smaEvents || [])
+        .filter(e => e.confirmed && (e.type === wantBreak || e.type === wantBounce))
+        .sort((a, b) => a.daysAgo - b.daysAgo)[0];
+      if (daily) {
+        maConfirmed = true; maConfirmVia = 'daily';
+        maState = (daily.type === wantBreak) ? 'CONFIRMED_BREAK' : 'CONFIRMED_BOUNCE';
+        const ago = daily.daysAgo === 0 ? 'today' : daily.daysAgo + 'd ago';
+        maNote = (maState === 'CONFIRMED_BREAK')
+          ? 'CONFIRMED daily break ' + (direction === 'SHORT' ? 'BELOW' : 'ABOVE') + ' ' + daily.ma + ' $' + daily.level
+            + ' ' + ago + ' on ' + (daily.volRatio != null ? daily.volRatio + '×' : '?') + ' vol — actionable.'
+          : 'CONFIRMED daily ' + (direction === 'SHORT' ? 'rejection at' : 'bounce off') + ' ' + daily.ma + ' $' + daily.level
+            + ' ' + ago + ' — actionable.';
+      }
+      if (!maConfirmed && Array.isArray(m5 && m5.recentCandles) && m5.recentCandles.length >= 3) {
+        const useCluster = maCluster && Math.abs((maCluster.center - d1.price) / _atrLocal) <= _MA_BAND_ATR;
+        const ref = useCluster ? maCluster.center : (maProximity[0] ? maProximity[0].level : null);
+        const refMa = useCluster ? maCluster.members.join('+') : (maProximity[0] ? maProximity[0].ma : null);
+        if (ref != null) {
+          const rc = m5.recentCandles.filter(c => c && c.c != null);
+          const last = rc[rc.length - 1];
+          const margin = 0.05 * _atrLocal;
+          const heavy = (paceRVol != null && paceRVol >= 1.4);
+          if (last) {
+            if (direction === 'SHORT') {
+              const wasAbove = rc.some(c => c.h != null && c.h > ref);
+              if (last.c < ref - margin && wasAbove && heavy) {
+                maConfirmed = true; maConfirmVia = 'M5'; maState = 'CONFIRMED_BREAK';
+                maNote = 'CONFIRMED intraday M5 break BELOW ' + refMa + ' $' + parseFloat(ref.toFixed(2)) + ' on heavy pace (' + paceRVol + '×) — actionable.';
+              } else if (rc.some(c => c.h != null && c.h >= ref && c.c < ref) && last.c < ref) {
+                maConfirmed = true; maConfirmVia = 'M5'; maState = 'CONFIRMED_BOUNCE';
+                maNote = 'CONFIRMED intraday M5 rejection at ' + refMa + ' $' + parseFloat(ref.toFixed(2)) + ' (tagged & closed back below) — actionable short.';
+              }
+            } else {
+              const wasBelow = rc.some(c => c.l != null && c.l < ref);
+              if (last.c > ref + margin && wasBelow && heavy) {
+                maConfirmed = true; maConfirmVia = 'M5'; maState = 'CONFIRMED_BREAK';
+                maNote = 'CONFIRMED intraday M5 break ABOVE ' + refMa + ' $' + parseFloat(ref.toFixed(2)) + ' on heavy pace (' + paceRVol + '×) — actionable.';
+              } else if (rc.some(c => c.l != null && c.l <= ref && c.c > ref) && last.c > ref) {
+                maConfirmed = true; maConfirmVia = 'M5'; maState = 'CONFIRMED_BOUNCE';
+                maNote = 'CONFIRMED intraday M5 bounce off ' + refMa + ' $' + parseFloat(ref.toFixed(2)) + ' (tagged & closed back above) — actionable long.';
+              }
+            }
+          }
+        }
+      }
+      if (maConfirmed) maConditional = false;
+    }
+
     const slowBleedShort = direction === 'SHORT'
                         && d1.aboveSma100 === false
                         && d1.aboveSma200 === false
@@ -1622,11 +1735,13 @@ window.RDT = (function () {
       if (confluences.some(c => c.includes('BROKE'))) cats++;
       if (confluences.some(c => c.includes('HA ') && c.includes('✅'))) cats++;
       const pConf = Math.min(cats, 2);
-      // v8.5.0 — MA-cluster penalty: a setup driving straight into a daily MA wall
-      // is into likely first-touch resistance/support, so dock the edge score and
-      // never let it rank/label as a clean immediately-actionable pick.
-      const maPenalty = maConditional ? (maState === 'AT_CLUSTER' ? 1.5 : 1.0) : 0;
-      const score = parseFloat((pEntry + pTrend + pRS + pRR + pConf - maPenalty).toFixed(2));
+      // v8.5.0/8.6.0 — MA adjustment. Driving into a daily MA wall docks the score
+      // (first-touch bounce risk); a CONFIRMED break-through / bounce-off boosts it
+      // (the ambiguity is resolved in the trade's favour and is a setup in itself).
+      const maAdj = maConfirmed ? 1.0
+                  : maConditional ? (maState === 'AT_CLUSTER' ? -1.5 : -1.0)
+                  : 0;
+      const score = parseFloat((pEntry + pTrend + pRS + pRR + pConf + maAdj).toFixed(2));
       // gap-chase guardrail: a 1–2 day trend on a huge (≥5%) single-day RS spike
       // cannot be HIGH — almost always an unconfirmed earnings/news gap.
       const gapChase = !!td && td <= 2 && Math.abs(rsScore || 0) >= 5;
@@ -1636,7 +1751,7 @@ window.RDT = (function () {
       if (maConditional && label === 'HIGH') label = 'MEDIUM';
       return {
         score, label,
-        factors: { pEntry, pTrend, pRS, pRR, pConf, maPenalty,
+        factors: { pEntry, pTrend, pRS, pRR, pConf, maAdj,
                    extAtr: ext == null ? null : parseFloat(ext.toFixed(2)),
                    trendDays: td, bestRR: parseFloat(bestRR.toFixed(2)) }
       };
@@ -1660,14 +1775,15 @@ window.RDT = (function () {
       if (conviction === 'HIGH') conviction = 'MEDIUM';
       conviction += ' 🔴 POST-GAP';
     }
-    // v8.5.0 — MA-cluster conditional tag (not immediately actionable).
-    if (maConditional) conviction += ' 🧭 MA-COND';
+    // v8.5.0/8.6.0 — MA tags: confirmed break/bounce (actionable) or conditional.
+    if (maConfirmed) conviction += (maState === 'CONFIRMED_BREAK' ? ' 🧭 BREAK ✅' : ' 🧭 BOUNCE ✅');
+    else if (maConditional) conviction += ' 🧭 MA-COND';
 
     return {
       direction, setupType, rsScore, hasRS, hasRW,
       confluences, conviction, edgeScore, convictionFactors, counterTrend, counterTrendStrength,
-      // v8.5.0 — daily SMA proximity + MA-cluster gate
-      maProximity, maCluster, maState, maConditional, maNote,
+      // v8.5.0 — daily SMA proximity + MA-cluster gate; v8.6.0 — confirmation
+      maProximity, maCluster, maState, maConditional, maNote, maConfirmed, maConfirmVia,
       rrEntry, rrStop, rrStopNote, rrT1, rrT1Source, rrT2, rrRatio, poorRR,
       compositeScore, swingEligible, swingCandidate, swingNote,
       bucket, entryNote, stopNote,
