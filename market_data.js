@@ -180,7 +180,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.7.0';
+  const VERSION = 'v8.7.2';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1777,9 +1777,26 @@ window.RDT = (function () {
       if (gapChase && label === 'HIGH') label = 'MEDIUM';
       // can't be HIGH conviction while shorting into support / longing into resistance
       if (maConditional && label === 'HIGH') label = 'MEDIUM';
+      // v8.7.2 — NET-DAY temper. A LONG on a clearly-red index day (SPY ≤ −0.5%)
+      // is a recovery-inside-a-down-day, not a clean uptrend, so dock it — UNLESS
+      // it earns the exception (per user): strong RS (≥2% vs SPY, the down-day
+      // accumulation signal) OR a confirmed trigger (MA break/bounce, or M5 holding
+      // above VWAP+SMA20). Mirror for SHORTS on a clearly-green day (≥ +0.5%) via RW.
+      const _dayRed = spyChangePct <= -0.5, _dayGreen = spyChangePct >= 0.5;
+      const _strongRSdir = Math.abs(rsScore || 0) >= 2.0;
+      const _confirmedTrig = maConfirmed
+        || (m5 && (direction === 'LONG' ? m5.m5_long_valid === true : m5.m5_short_valid === true));
+      let dayTempered = false;
+      if (((direction === 'LONG' && _dayRed) || (direction === 'SHORT' && _dayGreen))
+          && !_strongRSdir && !_confirmedTrig) {
+        dayTempered = true;
+      }
+      const dayTemper = dayTempered ? -1.0 : 0;
+      const finalScore = parseFloat((score + dayTemper).toFixed(2));
+      if (dayTempered && label === 'HIGH') label = 'MEDIUM';
       return {
-        score, label,
-        factors: { pEntry, pTrend, pRS, pRR, pConf, maAdj, maGovWeight,
+        score: finalScore, label, dayTempered,
+        factors: { pEntry, pTrend, pRS, pRR, pConf, maAdj, maGovWeight, dayTemper,
                    extAtr: ext == null ? null : parseFloat(ext.toFixed(2)),
                    trendDays: td, bestRR: parseFloat(bestRR.toFixed(2)) }
       };
@@ -1808,10 +1825,13 @@ window.RDT = (function () {
                                   : maState === 'CONFIRMED_REJECT' ? ' 🧭 REJECT ✅'
                                   : ' 🧭 BOUNCE ✅');
     else if (maConditional) conviction += ' 🧭 MA-COND';
+    // v8.7.2 — net-day temper tag (marginal long on a red day / short on a green day,
+    // without strong RS or a confirmed trigger).
+    if (_ec.dayTempered) conviction += (direction === 'LONG' ? ' ⚠️ NET-RED-DAY' : ' ⚠️ NET-GREEN-DAY');
 
     return {
       direction, setupType, rsScore, hasRS, hasRW,
-      confluences, conviction, edgeScore, convictionFactors, counterTrend, counterTrendStrength,
+      confluences, conviction, edgeScore, convictionFactors, dayTempered: _ec.dayTempered, counterTrend, counterTrendStrength,
       // v8.5.0 — daily SMA proximity + MA-cluster gate; v8.6.0 — confirmation
       maProximity, maCluster, maState, maConditional, maNote, maConfirmed, maConfirmVia, maGovWeight,
       rrEntry, rrStop, rrStopNote, rrT1, rrT1Source, rrT2, rrRatio, poorRR,
@@ -2123,16 +2143,50 @@ window.RDT = (function () {
                             && spyD1.d1_long_valid
                             && (spyD1.upDaysLast5 || 0) >= 3);
     console.log('[RDT ' + VERSION + '] SPY regime: ' + (spyMeltupRegime ? 'MELT-UP (above all SMAs + up ≥3 of last 5)' : 'not melt-up'));
-    // v8.4.0 Tier-2 — SPY intraday VWAP state drives the regime "flip" detector.
-    // Above VWAP (or unknown pre-open) = uptrend intact; below VWAP = intraday breakdown.
-    const spyAboveVwap = (spyM5 && typeof spyM5.aboveVwap === 'boolean') ? spyM5.aboveVwap : null;
-    console.log('[RDT ' + VERSION + '] SPY intraday: ' +
-      (spyAboveVwap === null ? 'VWAP n/a (pre-open/weekend) — treated as intact'
-       : spyAboveVwap ? 'above VWAP — uptrend intact' : 'below VWAP — INTRADAY BREAKDOWN'));
+    // v8.7.0 — SPY intraday VWAP state must be CONFIRMED, not read off the live
+    // price tick. A single 5-min poke above/below VWAP that the next candle
+    // reverses is NOT a regime flip. Require the last 2 completed 5-min CLOSES to
+    // agree: ABOVE = both > VWAP (uptrend intact) · BELOW = both < VWAP (confirmed
+    // intraday breakdown) · UNCONFIRMED = just crossed / straddling → NO flip, hold.
+    // spyAboveVwap is now derived from this confirmed state (UNCONFIRMED → null, so
+    // downstream treats it as "not a confirmed breakdown": shorts stay parked,
+    // longs are not freshly parked, and the report flags it as wait-for-confirmation).
+    const _spyVwap = (spyM5 && spyM5.vwap != null) ? parseFloat(spyM5.vwap) : null;
+    const _spyRC = (spyM5 && Array.isArray(spyM5.recentCandles))
+      ? spyM5.recentCandles.filter(c => c && c.c != null) : [];
+    let spyVwapState = null; // null = pre-open / insufficient data → treated as intact
+    if (_spyVwap != null && _spyRC.length >= 2) {
+      const a = _spyRC[_spyRC.length - 1].c, b = _spyRC[_spyRC.length - 2].c;
+      spyVwapState = (a > _spyVwap && b > _spyVwap) ? 'ABOVE'
+                   : (a < _spyVwap && b < _spyVwap) ? 'BELOW'
+                   : 'UNCONFIRMED';
+    } else if (_spyVwap != null && _spyRC.length === 1) {
+      spyVwapState = 'UNCONFIRMED'; // one candle is never a confirmed side
+    }
+    const spyAboveVwap = spyVwapState === 'ABOVE' ? true : spyVwapState === 'BELOW' ? false : null;
+    const spyChoppyVwap = spyVwapState === 'UNCONFIRMED';
+    console.log('[RDT ' + VERSION + '] SPY intraday: ' + (
+        spyVwapState === 'ABOVE'       ? 'above VWAP (2 closes confirmed) — uptrend intact'
+      : spyVwapState === 'BELOW'       ? 'below VWAP (2 closes confirmed) — INTRADAY BREAKDOWN'
+      : spyVwapState === 'UNCONFIRMED' ? 'churning at VWAP — UNCONFIRMED single-candle cross — NO regime flip (hold)'
+      :                                  'VWAP n/a (pre-open/weekend) — treated as intact'));
+    // v8.7.2 — day-direction factors into the read too: being ABOVE VWAP while
+    // still net RED on the day is a recovery-inside-a-down-day, not a clean uptrend.
+    const spyDayBias = spyChangePct <= -0.5 ? 'RED' : spyChangePct >= 0.5 ? 'GREEN' : 'FLAT';
+    const spySessionBias =
+        spyVwapState === 'UNCONFIRMED' ? 'CHOPPY'
+      : spyVwapState === 'BELOW'       ? (spyDayBias === 'GREEN' ? 'MIXED-DOWN' : 'BEARISH')
+      : /* ABOVE or pre-open */          (spyDayBias === 'RED'   ? 'MIXED-UP'   : 'BULLISH');
+    console.log('[RDT ' + VERSION + '] SPY session bias: ' + spySessionBias
+      + ' (day ' + (spyChangePct >= 0 ? '+' : '') + spyChangePct + '%, VWAP ' + (spyVwapState || 'n/a') + ')');
     const spyContext = {
       meltupRegime: spyMeltupRegime,
       upDaysLast5: spyD1?.upDaysLast5 ?? null,
       spyAboveVwap,
+      spyVwapState,
+      spyChoppyVwap,
+      spyDayBias,
+      spySessionBias,
     };
 
     const earningsMap = await fetchEarningsDates(tickers);
