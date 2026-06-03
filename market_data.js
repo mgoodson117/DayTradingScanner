@@ -180,7 +180,7 @@
 
 window.RDT = (function () {
 
-  const VERSION = 'v8.4.0';
+  const VERSION = 'v8.5.0';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1328,6 +1328,77 @@ window.RDT = (function () {
     const _distFrom52wHi = (d1.fiftyTwoWeekHigh > 0)
       ? (d1.price / d1.fiftyTwoWeekHigh - 1) * 100
       : null;
+
+    // v8.5.0 — DAILY SMA PROXIMITY & MA-CLUSTER GATE.
+    // The scanner has the SMA values but never measured how close a setup sits to
+    // them. Shorting straight into a converged MA *support* cluster (e.g. TTWO at
+    // SMA50/SMA100), or longing into an MA *resistance* cluster, bounces on first
+    // touch far more often than it breaks — so such setups are NOT immediately
+    // actionable. They become CONDITIONAL: valid only on a confirmed close THROUGH
+    // the cluster on ≥1.5× volume (breakthrough) or a bounce-and-reject off it.
+    const _MA_BAND_ATR = 0.5;          // "near" an MA / cluster (first-touch bounce zone)
+    const _MA_CLUSTER_WIDTH_ATR = 0.6; // SMAs within this band of each other = one cluster
+    const _maList = [
+      { ma: 'SMA20', level: d1.sma20 }, { ma: 'SMA50', level: d1.sma50 },
+      { ma: 'SMA100', level: d1.sma100 }, { ma: 'SMA200', level: d1.sma200 },
+    ].filter(x => typeof x.level === 'number' && x.level > 0 && _atrLocal > 0);
+    const maProximity = _maList.map(x => ({
+      ma: x.ma, level: parseFloat(x.level.toFixed(2)),
+      distAtr: parseFloat(((x.level - d1.price) / _atrLocal).toFixed(2)), // +ve = MA above price
+    })).sort((a, b) => Math.abs(a.distAtr) - Math.abs(b.distAtr));
+    let maCluster = null;
+    {
+      const sorted = [..._maList].sort((a, b) => a.level - b.level);
+      for (let i = 0; i < sorted.length; i++) {
+        const grp = [sorted[i]];
+        for (let j = i + 1; j < sorted.length; j++) {
+          if ((sorted[j].level - sorted[i].level) / _atrLocal <= _MA_CLUSTER_WIDTH_ATR) grp.push(sorted[j]);
+          else break;
+        }
+        if (grp.length >= 2) {
+          const center = grp.reduce((s, g) => s + g.level, 0) / grp.length;
+          const distAtr = Math.abs(center - d1.price) / _atrLocal;
+          if (!maCluster || distAtr < maCluster.distAtr)
+            maCluster = { members: grp.map(g => g.ma), center: parseFloat(center.toFixed(2)), distAtr: parseFloat(distAtr.toFixed(2)) };
+        }
+      }
+    }
+    // Directional hazard test. distAtr is +ve when the MA sits ABOVE price.
+    //   • Price sitting ON an MA/cluster (|distAtr| ≤ 0.25) → bounce-both-ways → hazard.
+    //   • SHORT bleeding INTO support (MA at/just BELOW price) → hazard.
+    //   • LONG running INTO resistance (MA at/just ABOVE price) → hazard.
+    //   • An MA on the FAVOURABLE side (resistance above a short / support below a
+    //     long) that price is NOT pinned to is NOT a hazard — that's a normal
+    //     bounce/rejection entry and stays actionable.
+    const _MA_AT_ATR = 0.25;
+    const _maHazard = (distAtr) => {
+      if (Math.abs(distAtr) <= _MA_AT_ATR) return true;
+      if (direction === 'SHORT') return distAtr < 0 && distAtr >= -_MA_BAND_ATR;
+      return distAtr > 0 && distAtr <= _MA_BAND_ATR;
+    };
+    let maState = 'CLEAR', maConditional = false, maNote = 'No daily MA hazard in the trade path — clean. Actionable.';
+    if (_maList.length && _atrLocal > 0 && (direction === 'LONG' || direction === 'SHORT')) {
+      const nearestMA = maProximity[0];
+      const clusterSigned = maCluster ? parseFloat(((maCluster.center - d1.price) / _atrLocal).toFixed(2)) : null;
+      const dir = direction === 'SHORT' ? 'BELOW' : 'ABOVE';
+      const verb = direction === 'SHORT' ? 'Shorting into' : 'Buying into';
+      if (maCluster && _maHazard(clusterSigned)) {
+        maState = 'AT_CLUSTER'; maConditional = true;
+        maNote = verb + ' a daily MA cluster (' + maCluster.members.join('+') + ' ≈ $' + maCluster.center
+          + ', ' + Math.abs(clusterSigned) + '×ATR ' + (clusterSigned >= 0 ? 'above' : 'below')
+          + ') — first touch usually bounces. CONDITIONAL: wait for a confirmed 5-min close '
+          + dir + ' $' + maCluster.center + ' on ≥1.5× vol (breakthrough), or a bounce-and-reject off it.';
+      } else if (nearestMA && _maHazard(nearestMA.distAtr)) {
+        maState = 'AT_MA'; maConditional = true;
+        maNote = verb + ' the daily ' + nearestMA.ma + ' $' + nearestMA.level + ' (' + Math.abs(nearestMA.distAtr)
+          + '×ATR ' + (nearestMA.distAtr >= 0 ? 'above' : 'below')
+          + ') — first-touch bounce risk. CONDITIONAL: need a confirmed close ' + dir + ' it on ≥1.5× vol, or a bounce-and-reject.';
+      } else if (nearestMA) {
+        maNote = 'Nearest daily MA: ' + nearestMA.ma + ' $' + nearestMA.level + ' (' + Math.abs(nearestMA.distAtr) + '×ATR '
+          + (nearestMA.distAtr >= 0 ? 'above' : 'below') + ') — favourable side / clear of walls. Actionable.';
+      }
+    }
+
     const slowBleedShort = direction === 'SHORT'
                         && d1.aboveSma100 === false
                         && d1.aboveSma200 === false
@@ -1551,15 +1622,21 @@ window.RDT = (function () {
       if (confluences.some(c => c.includes('BROKE'))) cats++;
       if (confluences.some(c => c.includes('HA ') && c.includes('✅'))) cats++;
       const pConf = Math.min(cats, 2);
-      const score = parseFloat((pEntry + pTrend + pRS + pRR + pConf).toFixed(2));
+      // v8.5.0 — MA-cluster penalty: a setup driving straight into a daily MA wall
+      // is into likely first-touch resistance/support, so dock the edge score and
+      // never let it rank/label as a clean immediately-actionable pick.
+      const maPenalty = maConditional ? (maState === 'AT_CLUSTER' ? 1.5 : 1.0) : 0;
+      const score = parseFloat((pEntry + pTrend + pRS + pRR + pConf - maPenalty).toFixed(2));
       // gap-chase guardrail: a 1–2 day trend on a huge (≥5%) single-day RS spike
       // cannot be HIGH — almost always an unconfirmed earnings/news gap.
       const gapChase = !!td && td <= 2 && Math.abs(rsScore || 0) >= 5;
       let label = score >= 7 ? 'HIGH' : score >= 4.5 ? 'MEDIUM' : 'LOW';
       if (gapChase && label === 'HIGH') label = 'MEDIUM';
+      // can't be HIGH conviction while shorting into support / longing into resistance
+      if (maConditional && label === 'HIGH') label = 'MEDIUM';
       return {
         score, label,
-        factors: { pEntry, pTrend, pRS, pRR, pConf,
+        factors: { pEntry, pTrend, pRS, pRR, pConf, maPenalty,
                    extAtr: ext == null ? null : parseFloat(ext.toFixed(2)),
                    trendDays: td, bestRR: parseFloat(bestRR.toFixed(2)) }
       };
@@ -1583,10 +1660,14 @@ window.RDT = (function () {
       if (conviction === 'HIGH') conviction = 'MEDIUM';
       conviction += ' 🔴 POST-GAP';
     }
+    // v8.5.0 — MA-cluster conditional tag (not immediately actionable).
+    if (maConditional) conviction += ' 🧭 MA-COND';
 
     return {
       direction, setupType, rsScore, hasRS, hasRW,
       confluences, conviction, edgeScore, convictionFactors, counterTrend, counterTrendStrength,
+      // v8.5.0 — daily SMA proximity + MA-cluster gate
+      maProximity, maCluster, maState, maConditional, maNote,
       rrEntry, rrStop, rrStopNote, rrT1, rrT1Source, rrT2, rrRatio, poorRR,
       compositeScore, swingEligible, swingCandidate, swingNote,
       bucket, entryNote, stopNote,
@@ -2042,6 +2123,11 @@ window.RDT = (function () {
       lines.push('     Price $' + d1.price + ' (' + (d1.changePct >= 0 ? '+' : '') + d1.changePct + '%) | RS ' + sc.rsScore + '%');
       lines.push('     M5 VWAP $' + (m5?.vwap || 'n/a') + ' ' + (m5?.aboveVwap === true ? '✅' : m5?.aboveVwap === false ? '⛔' : ''));
       lines.push('     HA ' + d1.haTrend + ' | ATR(20) $' + d1.atr20);
+      // v8.5.0 — daily MA proximity / cluster gate (always rendered per setup)
+      if (sc.maNote) lines.push('     🧭 Daily MA: ' + sc.maNote
+        + (sc.maProximity && sc.maProximity.length
+           ? '  [' + sc.maProximity.map(m => m.ma + ' ' + (m.distAtr >= 0 ? '+' : '') + m.distAtr + 'ATR').join(', ') + ']'
+           : ''));
       // v7.2.0 — inline volume block
       const volBits = [];
       if (sc.paceRVol != null) volBits.push(`Pace RVol ${sc.paceRVol}× (${sc.paceRVolLabel}) ${volEmoji(sc.paceRVol)}`);
