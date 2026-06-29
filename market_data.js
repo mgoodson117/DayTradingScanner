@@ -188,7 +188,7 @@ window.RDT = (function () {
   //   only ever tightens. (F) a confirmed break of one MA no longer clears the
   //   hazard of price sitting on a DIFFERENT major MA — maWallAtPrice negates the
   //   confirmation bonus, docks the score, caps conviction, and tags 🧭 MA-WALL.
-  const VERSION = 'v8.7.6';
+  const VERSION = 'v8.7.7';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1122,6 +1122,9 @@ window.RDT = (function () {
           m5VwapDistPct: vwapDistPct, m5VwapDistATR: vwapDistATR,
           m5RangeCompression: rangeCompression, m5Coiled: coiled,
           m5DayRangePos: dayRangePos, m5Structure: label, m5StructLongOk, m5StructShortOk,
+          // v8.7.7 — live intraday extremes (the daily payload's dayHigh/dayLow
+          // are cache-frozen at warm-time; these are the real session hi/lo).
+          m5SessionHigh: parseFloat(dHi.toFixed(2)), m5SessionLow: parseFloat(dLo.toFixed(2)),
         };
       })();
 
@@ -2353,6 +2356,20 @@ window.RDT = (function () {
       if (d1.dayPaceLabel) d1.dailyRVolLabel = d1.dayPaceLabel;
     }
 
+    // v8.7.7 — dayHigh / dayLow also ride in the cached interval=1d payload, so
+    // mid-session they are FROZEN at the cache-warm time (live price can print
+    // above a stale dayHigh). Refresh from the live M5 session extremes. This
+    // feeds the SPY HOD/LOD display, the spyHodBlock/spyLodBlock chase flags,
+    // getHODProximity, and per-ticker dayLow-based stops.
+    if (m5.m5SessionHigh != null && isFinite(m5.m5SessionHigh)) {
+      d1.dayHighStale = d1.dayHigh;
+      d1.dayHigh = Math.max(d1.dayHigh || 0, m5.m5SessionHigh);
+    }
+    if (m5.m5SessionLow != null && isFinite(m5.m5SessionLow) && m5.m5SessionLow > 0) {
+      d1.dayLowStale = d1.dayLow;
+      d1.dayLow = d1.dayLow ? Math.min(d1.dayLow, m5.m5SessionLow) : m5.m5SessionLow;
+    }
+
     const p = parseFloat(m5.price);
     if (!isFinite(p) || p <= 0) return d1;
     if (d1.price && Math.abs(p - d1.price) / d1.price < 0.0005) return d1; // already live
@@ -2637,7 +2654,10 @@ window.RDT = (function () {
       // v7.2.0 — inline volume block
       const volBits = [];
       if (sc.paceRVol != null) volBits.push(`Pace RVol ${sc.paceRVol}× (${sc.paceRVolLabel}) ${volEmoji(sc.paceRVol)}`);
-      if (d1.dailyRVol != null) volBits.push(`Daily RVol ${d1.dailyRVol}× (${d1.dailyRVolLabel})`);
+      // v8.7.7 — show PACE (time-of-day-adjusted) as the headline; the cumulative
+      // daily RVol is naturally a fraction mid-session and is shown as context.
+      if (d1.dayPaceRVol != null) volBits.push(`Pace ${d1.dayPaceRVol}× (${d1.dayPaceLabel}) [${d1.dailyRVol}× cumulative]`);
+      else if (d1.dailyRVol != null) volBits.push(`Daily RVol ${d1.dailyRVol}× (${d1.dailyRVolLabel})`);
       if (m5?.preMktVolRatio != null && m5.preMktDayCount >= 2) {
         volBits.push(`Pre-mkt ${m5.preMktVolRatio}× (${m5.preMktVolLabel}) ${volEmoji(m5.preMktVolRatio)}`);
       }
