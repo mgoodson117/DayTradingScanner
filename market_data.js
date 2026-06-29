@@ -188,7 +188,7 @@ window.RDT = (function () {
   //   only ever tightens. (F) a confirmed break of one MA no longer clears the
   //   hazard of price sitting on a DIFFERENT major MA — maWallAtPrice negates the
   //   confirmation bonus, docks the score, caps conviction, and tags 🧭 MA-WALL.
-  const VERSION = 'v8.7.4';
+  const VERSION = 'v8.7.5';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1028,8 +1028,106 @@ window.RDT = (function () {
         return out;
       })();
 
+      // v8.7.5 — INTRADAY STRUCTURE (the M5 analogue of the daily consolidation
+      // gate). A single last-tick "above/below VWAP" read cannot tell a clean
+      // trending pullback from (a) a gap-and-coil parked far above a stale VWAP
+      // or (b) a fresh VWAP cross after the name traded the other side for hours.
+      // We read the structure of the WHOLE regular-session series:
+      //   • m5VwapState   — 2-closes confirmation (mirrors the SPY v8.7.1 rule):
+      //                     ABOVE/BELOW only if the last two closes agree, else
+      //                     UNCONFIRMED (a single-bar poke is not a side).
+      //   • m5VwapConsec  — consecutive most-recent bars on the current side.
+      //   • m5BarsAbovePct— fraction of the session's bars that CLOSED above the
+      //                     running VWAP (a fresh reclaim has a LOW fraction).
+      //   • m5VwapDistATR — distance from VWAP in M5-ATR units (far = a pullback
+      //                     to VWAP is not a near-term entry; the gap is stale).
+      //   • m5Coiled / m5RangeCompression — last-hour range ÷ full-day range
+      //                     (a tight coil = trade the break, not a VWAP pullback).
+      //   • m5Structure   — TRENDING_UP / TRENDING_DOWN / COILED / FRESH_RECLAIM /
+      //                     FRESH_LOSS / VWAP_CHOP / ABOVE_VWAP / BELOW_VWAP.
+      //   • m5StructLongOk / m5StructShortOk — is the textbook pullback/bounce
+      //     entry actually supported (trending, not coiled, not parked far away)?
+      const m5Struct = (() => {
+        const blank = {
+          m5VwapState: null, m5VwapConsec: 0, m5BarsAbovePct: null, m5VwapDistATR: null,
+          m5RangeCompression: null, m5Coiled: null, m5DayRangePos: null,
+          m5Structure: 'N/A', m5StructLongOk: null, m5StructShortOk: null,
+        };
+        const n = sessionCloses.length;
+        if (vwap == null || n < 6) return blank;
+        // running VWAP path
+        let ctpv = 0, cvol = 0; const vpath = new Array(n);
+        for (let i = 0; i < n; i++) {
+          const h = sessionHighs[i], l = sessionLows[i], c = sessionCloses[i], v = sessionVolumes[i];
+          if (h != null && l != null && c != null && v) { ctpv += ((h + l + c) / 3) * v; cvol += v; }
+          vpath[i] = cvol > 0 ? ctpv / cvol : null;
+        }
+        let barsAbove = 0;
+        for (let i = 0; i < n; i++) { if (vpath[i] != null && sessionCloses[i] > vpath[i]) barsAbove++; }
+        const barsAbovePct = parseFloat((barsAbove / n).toFixed(2));
+        const sideUp = sessionCloses[n - 1] > vwap;
+        let consec = 0;
+        for (let i = n - 1; i >= 0; i--) { if ((sessionCloses[i] > vwap) === sideUp) consec++; else break; }
+        const a = sessionCloses[n - 1], b = sessionCloses[n - 2];
+        const vwapState = (a > vwap && b > vwap) ? 'ABOVE'
+                        : (a < vwap && b < vwap) ? 'BELOW' : 'UNCONFIRMED';
+        // Distance from VWAP as a % of price — the trader's question is "how far
+        // does price have to travel to fill a pullback to VWAP?" ≥1.5% = a real
+        // fade, not a near-term fill (this is what makes a gap-up reactor's
+        // "pullback to VWAP" bogus). Reported alongside an M5-ATR view for info.
+        const vwapDistPct = parseFloat(((price - vwap) / vwap * 100).toFixed(2));
+        const farFromVwap = Math.abs(vwapDistPct) >= 1.5;
+        const aw = Math.min(14, n); let asum = 0, acnt = 0;
+        for (let i = n - aw; i < n; i++) {
+          if (sessionHighs[i] != null && sessionLows[i] != null) { asum += (sessionHighs[i] - sessionLows[i]); acnt++; }
+        }
+        const atrM5 = acnt ? asum / acnt : null;
+        const vwapDistATR = (atrM5 && atrM5 > 0) ? parseFloat(((price - vwap) / atrM5).toFixed(2)) : null;
+        // Coil = the RECENT bars are compressing relative to the session's OWN
+        // average bar (scale- and time-of-day-independent). NOT last-hour ÷ day
+        // range, which inflates with the opening drive and flags everything.
+        let sessBarSum = 0, sessBarCnt = 0;
+        for (let i = 0; i < n; i++) {
+          if (sessionHighs[i] != null && sessionLows[i] != null) { sessBarSum += (sessionHighs[i] - sessionLows[i]); sessBarCnt++; }
+        }
+        const sessAvgBar = sessBarCnt ? sessBarSum / sessBarCnt : null;
+        const recWin = Math.min(6, n); let recBarSum = 0, recBarCnt = 0;
+        for (let i = n - recWin; i < n; i++) {
+          if (sessionHighs[i] != null && sessionLows[i] != null) { recBarSum += (sessionHighs[i] - sessionLows[i]); recBarCnt++; }
+        }
+        const recAvgBar = recBarCnt ? recBarSum / recBarCnt : null;
+        const rangeCompression = (sessAvgBar && sessAvgBar > 0 && recAvgBar != null)
+          ? parseFloat((recAvgBar / sessAvgBar).toFixed(2)) : null;
+        const coiled = (rangeCompression != null && rangeCompression <= 0.55 && n >= 12 && !farFromVwap);
+        const dHi = Math.max(...sessionHighs), dLo = Math.min(...sessionLows);
+        const dayRange = (dHi - dLo);
+        const dayRangePos = (dayRange > 0) ? parseFloat(((price - dLo) / dayRange).toFixed(2)) : null;
+        const sustainedAbove = vwapState === 'ABOVE' && consec >= 3 && barsAbovePct >= 0.5;
+        const sustainedBelow = vwapState === 'BELOW' && consec >= 3 && (1 - barsAbovePct) >= 0.5;
+        // Label priority: EXTENDED (VWAP fill is a real fade) → FRESH cross →
+        // TRENDING → COILED (tight near VWAP) → chop.
+        let label;
+        if (farFromVwap) label = price > vwap ? 'EXTENDED_UP' : 'EXTENDED_DOWN';
+        else if (vwapState === 'ABOVE' && !sustainedAbove) label = 'FRESH_RECLAIM';
+        else if (vwapState === 'BELOW' && !sustainedBelow) label = 'FRESH_LOSS';
+        else if (sustainedAbove && (dayRangePos == null || dayRangePos >= 0.55)) label = 'TRENDING_UP';
+        else if (sustainedBelow && (dayRangePos == null || dayRangePos <= 0.45)) label = 'TRENDING_DOWN';
+        else if (coiled) label = 'COILED';
+        else if (vwapState === 'UNCONFIRMED') label = 'VWAP_CHOP';
+        else label = vwapState === 'ABOVE' ? 'ABOVE_VWAP' : 'BELOW_VWAP';
+        const m5StructLongOk  = label === 'TRENDING_UP';
+        const m5StructShortOk = label === 'TRENDING_DOWN';
+        return {
+          m5VwapState: vwapState, m5VwapConsec: consec, m5BarsAbovePct: barsAbovePct,
+          m5VwapDistPct: vwapDistPct, m5VwapDistATR: vwapDistATR,
+          m5RangeCompression: rangeCompression, m5Coiled: coiled,
+          m5DayRangePos: dayRangePos, m5Structure: label, m5StructLongOk, m5StructShortOk,
+        };
+      })();
+
       return {
         ticker, price: price?.toFixed(2),
+        ...m5Struct,
         recentCandles,
         vwap: vwap?.toFixed(2) ?? null, aboveVwap,
         sma8_m5: sma8?.toFixed(2) ?? null,
@@ -1701,14 +1799,26 @@ window.RDT = (function () {
     let entryNote = 'No clear setup';
     if (m5 && m5.vwap) {
       const sma20part = m5.sma20_m5 ? ' or M5 SMA20 $' + m5.sma20_m5 : '';
+      // v8.7.5 — the entry wording now reflects intraday STRUCTURE, not just the
+      // last-tick side of VWAP. A coil (trade the break), a fresh cross (wait for
+      // a confirmed hold) and a name parked far from VWAP no longer read as a
+      // clean "buy/short the pullback ✅".
+      const st = m5.m5Structure;
+      const distTxt = (m5.m5VwapDistPct != null) ? ' (' + Math.abs(m5.m5VwapDistPct) + '% from VWAP)' : '';
       if (direction === 'LONG' || setupType === 'WAIT_VWAP_RECLAIM') {
-        entryNote = m5.aboveVwap
-          ? 'Above VWAP $' + m5.vwap + ' ✅ — buy pullback to VWAP' + sma20part
-          : 'Below VWAP $' + m5.vwap + ' — WAIT for reclaim';
+        if (st === 'EXTENDED_UP')        entryNote = '⏳ Extended' + distTxt + ' above VWAP $' + m5.vwap + ' — breakout-continuation only; a pullback to VWAP is a deep fade';
+        else if (st === 'COILED')        entryNote = '⏳ M5 COILED near VWAP $' + m5.vwap + ' — trade the range break, not a pullback';
+        else if (st === 'FRESH_RECLAIM') entryNote = '⏳ M5 just reclaimed VWAP $' + m5.vwap + ' after trading below — WAIT for a confirmed hold (2 closes)';
+        else if (m5.m5StructLongOk)      entryNote = 'Above VWAP $' + m5.vwap + ' ✅ HELD — buy pullback to VWAP' + sma20part;
+        else if (m5.aboveVwap)           entryNote = '⏳ Above VWAP $' + m5.vwap + ' but not trending (' + st + ') — WAIT for a held pullback' + sma20part;
+        else                             entryNote = 'Below VWAP $' + m5.vwap + ' — WAIT for reclaim';
       } else if (direction === 'SHORT') {
-        entryNote = !m5.aboveVwap
-          ? 'Below VWAP $' + m5.vwap + ' ✅ — short bounces to VWAP' + sma20part
-          : 'Above VWAP $' + m5.vwap + ' — WAIT for rejection';
+        if (st === 'EXTENDED_DOWN')      entryNote = '⏳ Extended' + distTxt + ' below VWAP $' + m5.vwap + ' — breakdown-continuation only; a bounce to VWAP is a deep rip';
+        else if (st === 'COILED')        entryNote = '⏳ M5 COILED near VWAP $' + m5.vwap + ' — trade the range break, not a bounce';
+        else if (st === 'FRESH_LOSS')    entryNote = '⏳ M5 just lost VWAP $' + m5.vwap + ' after trading above — WAIT for a confirmed hold (2 closes)';
+        else if (m5.m5StructShortOk)     entryNote = 'Below VWAP $' + m5.vwap + ' ✅ HELD — short bounces to VWAP' + sma20part;
+        else if (!m5.aboveVwap)          entryNote = '⏳ Below VWAP $' + m5.vwap + ' but not trending (' + st + ') — WAIT for a rejection' + sma20part;
+        else                             entryNote = 'Above VWAP $' + m5.vwap + ' — WAIT for rejection';
       }
     }
 
