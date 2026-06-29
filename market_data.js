@@ -188,7 +188,7 @@ window.RDT = (function () {
   //   only ever tightens. (F) a confirmed break of one MA no longer clears the
   //   hazard of price sitting on a DIFFERENT major MA — maWallAtPrice negates the
   //   confirmation bonus, docks the score, caps conviction, and tags 🧭 MA-WALL.
-  const VERSION = 'v8.7.3';
+  const VERSION = 'v8.7.4';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -2197,6 +2197,86 @@ window.RDT = (function () {
     return analyze(combined, candidates, spyChangePct, universeD1);
   }
 
+  // ---------------------------------------------------------------------------
+  // v8.7.4 — live-price reconciliation for the daily snapshot.
+  //
+  // The headless runner caches interval=1d chart payloads to disk for the day,
+  // and meta.regularMarketPrice rides INSIDE that payload. So on a cached pass
+  // d1.price (the displayed daily snapshot price) can be stale by hours, while
+  // the M5 payload — never cached — carries the live regularMarketPrice. That
+  // left every current-price-derived daily field (trend validity, MA side,
+  // change/gap %, RS input, nearATH/ATL, SMA break/bounce confirmation, and the
+  // algo-line side/proximity flags) computed off a stale price, and made the
+  // displayed price disagree with the live M5 VWAP flag.
+  //
+  // This overwrites d1.price with the live M5 price (same regularMarketPrice
+  // field, freshly fetched) and recomputes those fields. It is a no-op when the
+  // two already agree within 5bps — i.e. on a fresh, uncached daily fetch — so
+  // it is safe to call unconditionally. The pre-reconcile value is preserved on
+  // d1.priceStale for audit.
+  // ---------------------------------------------------------------------------
+  function reconcileD1WithLivePrice(d1, m5) {
+    if (!d1 || d1.error || !m5 || m5.error) return d1;
+    const p = parseFloat(m5.price);
+    if (!isFinite(p) || p <= 0) return d1;
+    if (d1.price && Math.abs(p - d1.price) / d1.price < 0.0005) return d1; // already live
+
+    const prevClose = (Array.isArray(d1.closes_last5) && d1.closes_last5.length >= 2)
+      ? d1.closes_last5[d1.closes_last5.length - 2] : null;
+
+    d1.priceStale = d1.price;        // preserve the cached snapshot for audit
+    d1.priceSource = 'm5_live';
+    d1.price = parseFloat(p.toFixed(2));
+
+    if (prevClose) {
+      const chg = parseFloat(((p - prevClose) / prevClose * 100).toFixed(2));
+      d1.changePct = chg;
+      d1.overnightGapPct = chg;
+    }
+
+    d1.aboveSma20  = d1.sma20  ? p > d1.sma20  : d1.aboveSma20;
+    d1.aboveSma50  = d1.sma50  ? p > d1.sma50  : d1.aboveSma50;
+    d1.aboveSma100 = d1.sma100 ? p > d1.sma100 : d1.aboveSma100;
+    d1.aboveSma200 = d1.sma200 ? p > d1.sma200 : d1.aboveSma200;
+    d1.d1_long_valid  = !!(d1.sma20 && d1.sma50 && d1.sma100 && d1.sma200 &&
+                           p > d1.sma20 && p > d1.sma50 && p > d1.sma100 && p > d1.sma200);
+    d1.d1_short_valid = !!(d1.sma20 && d1.sma50 && p < d1.sma20 && p < d1.sma50);
+
+    const overhead = [
+      { label: 'SMA20', val: d1.sma20 }, { label: 'SMA50', val: d1.sma50 },
+      { label: 'SMA100', val: d1.sma100 }, { label: 'SMA200', val: d1.sma200 },
+    ].filter(s => s.val && s.val > p).sort((a, b) => a.val - b.val);
+    d1.nearestOverhead = overhead[0] || null;
+
+    if (d1.fiftyTwoWeekHigh) d1.nearATH = p >= d1.fiftyTwoWeekHigh * 0.97;
+    if (d1.fiftyTwoWeekLow)  d1.nearATL = p <= d1.fiftyTwoWeekLow * 1.03;
+
+    // SMA break/bounce confirmation is "does price sit on the correct side NOW".
+    if (Array.isArray(d1.smaEvents)) {
+      for (const e of d1.smaEvents) {
+        if (!e || e.level == null) continue;
+        const volOk = !!(e.volRatio && e.volRatio >= 1.5);
+        if (e.type === 'BREAK_DOWN')       e.confirmed = volOk && p < e.level;
+        else if (e.type === 'BREAK_UP')    e.confirmed = volOk && p > e.level;
+        else if (e.type === 'BOUNCE_UP')   e.confirmed = p > e.level;
+        else if (e.type === 'BOUNCE_DOWN') e.confirmed = p < e.level;
+      }
+    }
+
+    // Algo-line side / proximity flags are current-price relative; horizontal
+    // support/resistance polarity flips with the price too. Re-sort nearest-first.
+    if (Array.isArray(d1.algoLines)) {
+      for (const ln of d1.algoLines) {
+        if (!ln || ln.level == null) continue;
+        ln.above = ln.level > p;
+        ln.nearCurrent = Math.abs(ln.level - p) / p < 0.03;
+        if (ln.style === 'HORIZONTAL') ln.type = ln.level > p ? 'RESISTANCE' : 'SUPPORT';
+      }
+      d1.algoLines.sort((a, b) => Math.abs(a.level - p) - Math.abs(b.level - p));
+    }
+    return d1;
+  }
+
   async function analyze(tickers, candidates, spyChangePctIn, d1Cache) {
     const etCtx = getETContext();
     d1Cache = d1Cache || {};
@@ -2205,6 +2285,9 @@ window.RDT = (function () {
     // The /v7/finance/quote endpoint sometimes returns 0 (caching/timing flakes);
     // spyD1.changePct is computed from prevDayClose → current price and is always accurate.
     const [spyD1, spyM5] = await Promise.all([fetchD1('SPY'), fetchM5('SPY')]);
+    // v8.7.4 — reconcile SPY's daily snapshot price with the live M5 price BEFORE
+    // deriving spyChangePct / melt-up regime / HOD-LOD blocks (all read spyD1).
+    reconcileD1WithLivePrice(spyD1, spyM5);
     const spyChangePct = (spyD1 && !spyD1.error && typeof spyD1.changePct === 'number')
       ? spyD1.changePct
       : (spyChangePctIn ?? 0);
@@ -2277,6 +2360,10 @@ window.RDT = (function () {
           cachedD1 && !cachedD1.error ? Promise.resolve(cachedD1) : fetchD1(t),
           fetchM5(t),
         ]);
+        // v8.7.4 — reconcile the (possibly disk-cached) daily snapshot price with
+        // the always-live M5 price before scoring, so trend validity / MA side /
+        // gap / RS / nearATH all reflect the live tape. No-op on a fresh fetch.
+        reconcileD1WithLivePrice(d1, m5);
         const cand = (candidates || []).find(c => c.symbol === t);
         const earningsDate = earningsMap[t] || cand?.earningsDate || null;
         const earningsInfo = checkEarnings(earningsDate, d1.maxRecentGap);
