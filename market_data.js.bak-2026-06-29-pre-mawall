@@ -180,15 +180,7 @@
 
 window.RDT = (function () {
 
-  // v8.7.3 (2026-06-29) — MA-aware targets & wall guard. Two structure-in-path
-  //   fixes after the ON 2026-06-29 miss (featured short while sitting on its
-  //   100-day): (A) targets are now capped at an un-cleared 100/200-day in the
-  //   path — the target system was previously blind to MAs, so a far target
-  //   (e.g. ON's $55) sailed through the 100/200-day and inflated R:R; the cap
-  //   only ever tightens. (F) a confirmed break of one MA no longer clears the
-  //   hazard of price sitting on a DIFFERENT major MA — maWallAtPrice negates the
-  //   confirmation bonus, docks the score, caps conviction, and tags 🧭 MA-WALL.
-  const VERSION = 'v8.7.3';
+  const VERSION = 'v8.7.2';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -1347,42 +1339,6 @@ window.RDT = (function () {
       }
     }
 
-    // v8.7.3 — cap targets at an un-cleared major MA in the path. The target
-    // derivation above uses only price-action algo lines + raw ATR, so it is blind
-    // to the 100/200-day. A target sitting beyond an un-broken major MA overstates
-    // the reward; cap it at that MA (the realistic first target) and recompute the
-    // ratio. Conservative: only ever TIGHTENS a target, never extends one. The MA
-    // must sit on the trade-direction side of the CURRENT price (support below for a
-    // short, resistance above for a long). Fixes the structure-blind R:R class that
-    // ranked ON's $55 short target straight through its 100/200-day on 2026-06-29.
-    if (direction === 'LONG' || direction === 'SHORT') {
-      const _majMAs = [d1.sma100, d1.sma200].filter(v => typeof v === 'number' && v > 0);
-      const _px = d1.price;
-      const _capT = (t) => {
-        if (t == null || _px == null) return t;
-        let c = t;
-        for (const ma of _majMAs) {
-          if (direction === 'SHORT') { if (ma < _px && ma > c) c = ma; }      // raise the lower target up to the wall
-          else                       { if (ma > _px && ma < c) c = ma; }      // lower the higher target down to the wall
-        }
-        return parseFloat(c.toFixed(2));
-      };
-      const _t1c = _capT(rrT1), _t2c = _capT(rrT2);
-      if (_t1c !== rrT1 || _t2c !== rrT2) {
-        rrT1 = _t1c; rrT2 = _t2c;
-        rrT1Source = (rrT1Source || 'target') + ' [capped at major MA]';
-        if (rrT1 != null && rrStop != null) {
-          if (direction === 'SHORT' && rrEntry < rrStop) {
-            const risk = rrStop - rrEntry, reward = rrEntry - rrT1;
-            rrRatio = (reward > 0 && risk > 0) ? parseFloat((reward / risk).toFixed(1)) : null;
-          } else if (direction === 'LONG' && rrEntry > rrStop) {
-            const risk = rrEntry - rrStop, reward = rrT1 - rrEntry;
-            rrRatio = (reward > 0 && risk > 0) ? parseFloat((reward / risk).toFixed(1)) : null;
-          }
-        }
-      }
-    }
-
     const poorRR = rrRatio != null && rrRatio < 1.5;
     const haMult = d1.haTrend === 'BULLISH' || d1.haTrend === 'BEARISH' ? 1.3 : 0.9;
     let horizWeightBonus = 0;
@@ -1484,8 +1440,6 @@ window.RDT = (function () {
     const maWeightOf = (ma) => !ma ? 1.0 : /200/.test(ma) ? 1.4 : /100/.test(ma) ? 1.1 : /50/.test(ma) ? 0.85 : 0.6;
     let maGovWeight = 1.0; // weight of the SMA/cluster governing this setup's MA state
     let maState = 'CLEAR', maConditional = false, maNote = 'No daily MA hazard in the trade path — clean. Actionable.';
-    let maWallAtPrice = false;       // v8.7.3 — price sitting on a major MA other than a just-confirmed break
-    let _confirmedMaLevel = null;    // v8.7.3 — level of the MA whose break/bounce was confirmed (to exclude it from the wall re-check)
     if (_maList.length && _atrLocal > 0 && (direction === 'LONG' || direction === 'SHORT')) {
       const nearestMA = maProximity[0];
       const clusterSigned = maCluster ? parseFloat(((maCluster.center - d1.price) / _atrLocal).toFixed(2)) : null;
@@ -1534,7 +1488,6 @@ window.RDT = (function () {
         .sort((a, b) => (maWeightOf(b.ma) - maWeightOf(a.ma)) || (a.daysAgo - b.daysAgo))[0];
       if (daily) {
         maConfirmed = true; maConfirmVia = 'daily'; maGovWeight = maWeightOf(daily.ma);
-        _confirmedMaLevel = daily.level;
         const isBreak = daily.type.indexOf('BREAK') === 0;
         // direction-accurate state: LONG off support = BOUNCE; SHORT at resistance = REJECT.
         maState = isBreak ? 'CONFIRMED_BREAK' : (direction === 'SHORT' ? 'CONFIRMED_REJECT' : 'CONFIRMED_BOUNCE');
@@ -1575,34 +1528,12 @@ window.RDT = (function () {
               }
             }
           }
-          if (maConfirmVia === 'M5') { maGovWeight = useCluster
+          if (maConfirmVia === 'M5') maGovWeight = useCluster
             ? Math.max.apply(null, maCluster.members.map(maWeightOf))
             : maWeightOf(maProximity[0] && maProximity[0].ma);
-            _confirmedMaLevel = ref; }
         }
       }
       if (maConfirmed) maConditional = false;
-      // v8.7.3 — a confirmed break/bounce of ONE MA does NOT clear the hazard of
-      // price sitting on a DIFFERENT major MA (a fresh wall in the path; first
-      // touch bounces). Fixes the ON 2026-06-29 miss: a confirmed 50-day break
-      // masked price sitting on the 100-day at +0.09×ATR, so the setup was scored
-      // as a clean actionable break instead of a short into support.
-      if (maConfirmed && maProximity.length) {
-        const _nm = maProximity[0];
-        const _isMajor = /100|200/.test(_nm.ma);
-        const _sameAsConfirmed = _confirmedMaLevel != null
-          && Math.abs(_nm.level - _confirmedMaLevel) <= 0.01;
-        if (_isMajor && !_sameAsConfirmed && Math.abs(_nm.distAtr) <= _MA_AT_ATR) {
-          maWallAtPrice = true;
-          maGovWeight = maWeightOf(_nm.ma);   // weight the penalty by the wall MA (100→1.1, 200→1.4)
-          maNote += ' ⚠️ WALL: price is also sitting on the ' + _nm.ma + ' $' + _nm.level
-            + ' (' + Math.abs(_nm.distAtr) + '×ATR) — a fresh '
-            + (direction === 'SHORT' ? 'support' : 'resistance')
-            + ' wall in the path. The break is real, but the entry needs a confirmed close '
-            + (direction === 'SHORT' ? 'below ' : 'above ') + _nm.level
-            + ' first; first touch of the ' + _nm.ma + ' typically bounces.';
-        }
-      }
     }
 
     const slowBleedShort = direction === 'SHORT'
@@ -1834,10 +1765,7 @@ window.RDT = (function () {
       // v8.6.0 — base MA adjustment, SCALED by the governing SMA's timeframe weight
       // (SMA20 ×0.6 … SMA200 ×1.4). A confirmed break of the 200 swings the edge
       // far more than a 20; a hazard at the 200 is a far stronger bounce risk.
-      // v8.7.3 — sitting on a major MA wall (even with a confirmed break of a
-      // different MA) NEGATES the confirmation bonus and docks like a hazard.
-      const maAdjBase = maWallAtPrice ? -1.0
-                      : maConfirmed ? 1.0
+      const maAdjBase = maConfirmed ? 1.0
                       : maConditional ? (maState === 'AT_CLUSTER' ? -1.5 : -1.0)
                       : 0;
       const maAdj = parseFloat((maAdjBase * (maGovWeight || 1.0)).toFixed(2));
@@ -1849,8 +1777,6 @@ window.RDT = (function () {
       if (gapChase && label === 'HIGH') label = 'MEDIUM';
       // can't be HIGH conviction while shorting into support / longing into resistance
       if (maConditional && label === 'HIGH') label = 'MEDIUM';
-      // v8.7.3 — nor while sitting on a major MA wall (first-touch bounce risk)
-      if (maWallAtPrice && label === 'HIGH') label = 'MEDIUM';
       // v8.7.2 — NET-DAY temper. A LONG on a clearly-red index day (SPY ≤ −0.5%)
       // is a recovery-inside-a-down-day, not a clean uptrend, so dock it — UNLESS
       // it earns the exception (per user): strong RS (≥2% vs SPY, the down-day
@@ -1899,7 +1825,6 @@ window.RDT = (function () {
                                   : maState === 'CONFIRMED_REJECT' ? ' 🧭 REJECT ✅'
                                   : ' 🧭 BOUNCE ✅');
     else if (maConditional) conviction += ' 🧭 MA-COND';
-    if (maWallAtPrice) conviction += ' 🧭 MA-WALL';
     // v8.7.2 — net-day temper tag (marginal long on a red day / short on a green day,
     // without strong RS or a confirmed trigger).
     if (_ec.dayTempered) conviction += (direction === 'LONG' ? ' ⚠️ NET-RED-DAY' : ' ⚠️ NET-GREEN-DAY');
@@ -1908,7 +1833,7 @@ window.RDT = (function () {
       direction, setupType, rsScore, hasRS, hasRW,
       confluences, conviction, edgeScore, convictionFactors, dayTempered: _ec.dayTempered, counterTrend, counterTrendStrength,
       // v8.5.0 — daily SMA proximity + MA-cluster gate; v8.6.0 — confirmation
-      maProximity, maCluster, maState, maConditional, maWallAtPrice, maNote, maConfirmed, maConfirmVia, maGovWeight,
+      maProximity, maCluster, maState, maConditional, maNote, maConfirmed, maConfirmVia, maGovWeight,
       rrEntry, rrStop, rrStopNote, rrT1, rrT1Source, rrT2, rrRatio, poorRR,
       compositeScore, swingEligible, swingCandidate, swingNote,
       bucket, entryNote, stopNote,
