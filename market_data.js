@@ -188,7 +188,7 @@ window.RDT = (function () {
   //   only ever tightens. (F) a confirmed break of one MA no longer clears the
   //   hazard of price sitting on a DIFFERENT major MA — maWallAtPrice negates the
   //   confirmation bonus, docks the score, caps conviction, and tags 🧭 MA-WALL.
-  const VERSION = 'v8.7.5';
+  const VERSION = 'v8.7.6';
 
   const SECTOR_ETFS = {
     XLK: 'Technology', XLE: 'Energy', XLF: 'Financials', XLV: 'Healthcare',
@@ -2327,6 +2327,32 @@ window.RDT = (function () {
   // ---------------------------------------------------------------------------
   function reconcileD1WithLivePrice(d1, m5) {
     if (!d1 || d1.error || !m5 || m5.error) return d1;
+
+    // v8.7.6 — VOLUME also rides in the cached interval=1d payload, so mid-session
+    // `volume_today` / `dailyRVol` are FROZEN at the cache-warm time and read
+    // absurdly low (SPY showed 0.16× off a stale 10.1M while 28M had actually
+    // traded). And even live, a cumulative-so-far RVol is naturally a fraction of
+    // a full day mid-session — it is NOT "X% below normal." Refresh `volume_today`
+    // from the live M5 regular-session cumulative and add a session-phase-PROJECTED
+    // pace (`dayPaceRVol`), which is the honest "running light/heavy vs normal"
+    // read. Runs on every call (cheap, idempotent on a fresh fetch) — placed
+    // before the price early-return so the pace fields are always populated.
+    if (m5.sessionVolume && d1.volume_avg20) {
+      const liveVol = m5.sessionVolume;
+      d1.volumeStale = d1.volume_today;
+      d1.volume_today = liveVol;
+      d1.dailyRVol = parseFloat((liveVol / d1.volume_avg20).toFixed(2)); // live cumulative-so-far
+      const elapsedMin = (m5.candleCount || 0) * 5;
+      const frac = elapsedMin > 0 ? Math.min(1, elapsedMin / 390) : null;
+      d1.dayElapsedPct = frac != null ? Math.round(frac * 100) : null;
+      d1.dayPaceRVol = (frac && frac > 0) ? parseFloat(((liveVol / frac) / d1.volume_avg20).toFixed(2)) : null;
+      const pv = d1.dayPaceRVol;
+      d1.dayPaceLabel = pv == null ? null
+        : pv >= 1.5 ? 'HEAVY' : pv >= 1.0 ? 'NORMAL' : pv >= 0.7 ? 'LIGHT' : 'VERY LIGHT';
+      // dailyRVolLabel now reflects PACE (time-of-day-adjusted), not cumulative.
+      if (d1.dayPaceLabel) d1.dailyRVolLabel = d1.dayPaceLabel;
+    }
+
     const p = parseFloat(m5.price);
     if (!isFinite(p) || p <= 0) return d1;
     if (d1.price && Math.abs(p - d1.price) / d1.price < 0.0005) return d1; // already live
@@ -2525,7 +2551,15 @@ window.RDT = (function () {
       if (sm5 && !sm5.error) lines.push('  M5: VWAP $' + sm5.vwap + ' | ' + getM5TrendState(sm5));
       // v7.2.0 — SPY-level volume read for the daily-bias block
       if (sd1.dailyRVol != null) {
-        lines.push('  📊 SPY Volume — Daily RVol ' + sd1.dailyRVol + '× (' + sd1.dailyRVolLabel + ') ' + volEmoji(sd1.dailyRVol));
+        // v8.7.6 — report PACE (time-of-day-adjusted), not the cumulative-so-far
+        // RVol, which is naturally a fraction of a full day mid-session.
+        if (sd1.dayPaceRVol != null) {
+          lines.push('  📊 SPY Volume — Pace ' + sd1.dayPaceRVol + '× (' + (sd1.dayPaceLabel || '') + ') '
+            + volEmoji(sd1.dayPaceRVol) + ' — ' + (sd1.volume_today/1e6).toFixed(1) + 'M so far at '
+            + (sd1.dayElapsedPct ?? '?') + '% of session (cumulative ' + sd1.dailyRVol + '× of a full day)');
+        } else {
+          lines.push('  📊 SPY Volume — Daily RVol ' + sd1.dailyRVol + '× (' + sd1.dailyRVolLabel + ') ' + volEmoji(sd1.dailyRVol));
+        }
       }
       // v8.0.0 — SPY-at-HOD/LOD chase-risk warning (Phase-1 Rule 9)
       if (s.spyHodBlock) {
